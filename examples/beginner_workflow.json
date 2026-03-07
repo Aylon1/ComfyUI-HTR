@@ -1,0 +1,58 @@
+{
+  "1": {
+    "inputs": {
+      "image": "example_suetterlin.jpg",
+      "upload": "image"
+    },
+    "class_type": "LoadImage"
+  },
+  "2": {
+    "inputs": {
+      "model_name": "dh-unibe/trocr-kurrent",
+      "device": "auto",
+      "dtype": "auto"
+    },
+    "class_type": "DownloadAndLoadTrOCR"
+  },
+  "3": {
+    "inputs": {
+      "model": "microsoft/Florence-2-base",
+      "precision": "fp16",
+      "attention": "sdpa"
+    },
+    "class_type": "DownloadAndLoadFlorence2Model"
+  },
+  "4": {
+    "inputs": {
+      "florence2_task": "<OCR_WITH_REGION>",
+      "padding": 4,
+      "min_confidence": 0.3,
+      "visualize": true,
+      "image": [
+        "1",
+        0
+      ],
+      "florence2_model": [
+        "3",
+        0
+      ],
+      "trocr_model": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "SuetterlinHTRComplete"
+  },
+  "5": {
+    "inputs": {
+      "text": [
+        "4",
+        0
+      ],
+      "save_to_file": false,
+      "output_path": "output",
+      "format": "txt"
+    },
+    "class_type": "TextOutput"
+  }
+}
