@@ -46,15 +46,53 @@ class SuetterlinHTRComplete:
         inputs["input_ids"] = inputs["input_ids"].to(device)
         inputs["pixel_values"] = inputs["pixel_values"].to(device, dtype=model_dtype)
         
-        with torch.no_grad():
-            generated_ids = fl2_model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=1024,
-                early_stopping=False,
-                do_sample=False,
-                num_beams=3,
-            )
+        # Monkeypatch prepare_inputs_for_generation to handle EncoderDecoderCache vs tuple
+        original_prepare = fl2_model.language_model.prepare_inputs_for_generation
+        def patched_prepare(*args, **kwargs):
+            if "past_key_values" in kwargs and kwargs["past_key_values"] is not None:
+                pkv = kwargs["past_key_values"]
+                if hasattr(pkv, "to_legacy_cache"):
+                    kwargs["past_key_values"] = pkv.to_legacy_cache()
+                elif hasattr(pkv, "key_cache") and hasattr(pkv, "value_cache"):
+                    kwargs["past_key_values"] = tuple(
+                        (k, v) for k, v in zip(pkv.key_cache, pkv.value_cache)
+                    )
+                elif not isinstance(pkv, tuple):
+                    try:
+                        # Sometimes pkv is a Cache object that has to_legacy_cache but isn't checked correctly
+                        # Just grab the actual cache structure if we can. In standard cache objects it's key_cache
+                        kwargs["past_key_values"] = tuple(
+                            (k, v) for k, v in zip(getattr(pkv, "key_cache"), getattr(pkv, "value_cache"))
+                        )
+                    except Exception:
+                        pass
+            return original_prepare(*args, **kwargs)
+            
+        import warnings
+        import logging
+        
+        transformers_logger = logging.getLogger("transformers")
+        old_level = transformers_logger.level
+        
+        try:
+            fl2_model.language_model.prepare_inputs_for_generation = patched_prepare
+            transformers_logger.setLevel(logging.ERROR)
+            
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with torch.no_grad():
+                    generated_ids = fl2_model.generate(
+                        input_ids=inputs["input_ids"],
+                        pixel_values=inputs["pixel_values"],
+                        max_new_tokens=1024,
+                        early_stopping=False,
+                        do_sample=False,
+                        num_beams=3,
+                        use_cache=False,  # adding it back to avoid cache usage entirely, warning is suppressed
+                    )
+        finally:
+            fl2_model.language_model.prepare_inputs_for_generation = original_prepare
+            transformers_logger.setLevel(old_level)
             
         generated_text = fl2_processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
         parsed_answer = fl2_processor.post_process_generation(
