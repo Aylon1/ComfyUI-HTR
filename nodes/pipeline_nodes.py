@@ -39,11 +39,12 @@ class SuetterlinHTRComplete:
         task_prompt = "<OCR_WITH_REGION>"
         inputs = fl2_processor(text=task_prompt, images=pil_img, return_tensors="pt")
         
-        device = fl2_model.device
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        fl2_model.to(device)
         model_dtype = next(fl2_model.parameters()).dtype
         
         inputs["input_ids"] = inputs["input_ids"].to(device)
-        inputs["pixel_values"] = inputs["pixel_values"].to(device, model_dtype)
+        inputs["pixel_values"] = inputs["pixel_values"].to(device, dtype=model_dtype)
         
         with torch.no_grad():
             generated_ids = fl2_model.generate(
