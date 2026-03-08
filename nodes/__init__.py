@@ -114,20 +114,17 @@ try:
         PrintedHandwrittenClassifier,
         MixedScriptRouter,
         MergeTranscriptions,
-        DownloadCalamariFrakturModel,
         LoadCalamariFrakturModel,
     )
     NODE_CLASS_MAPPINGS["CalamariFraktur"] = CalamariFrakturNode
     NODE_CLASS_MAPPINGS["PrintedHandwrittenClassifier"] = PrintedHandwrittenClassifier
     NODE_CLASS_MAPPINGS["MixedScriptRouter"] = MixedScriptRouter
     NODE_CLASS_MAPPINGS["MergeTranscriptions"] = MergeTranscriptions
-    NODE_CLASS_MAPPINGS["DownloadCalamariFrakturModel"] = DownloadCalamariFrakturModel
     NODE_CLASS_MAPPINGS["LoadCalamariFrakturModel"] = LoadCalamariFrakturModel
     NODE_DISPLAY_NAME_MAPPINGS["CalamariFraktur"] = "Calamari Fraktur OCR"
     NODE_DISPLAY_NAME_MAPPINGS["PrintedHandwrittenClassifier"] = "Printed/Handwritten Classifier"
     NODE_DISPLAY_NAME_MAPPINGS["MixedScriptRouter"] = "Mixed Script Router"
     NODE_DISPLAY_NAME_MAPPINGS["MergeTranscriptions"] = "Merge Transcriptions"
-    NODE_DISPLAY_NAME_MAPPINGS["DownloadCalamariFrakturModel"] = "Download Calamari Fraktur Model"
     NODE_DISPLAY_NAME_MAPPINGS["LoadCalamariFrakturModel"] = "Load Calamari Fraktur Model"
 except Exception as e:
     logger.warning(f"Could not import calamari_nodes: {e}")
