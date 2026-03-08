@@ -179,3 +179,68 @@ class VisualizeDetections:
                 annotated_images.append(pil_img)
                 
         return (pil2tensor(annotated_images),)
+
+class GenericBBoxToCrop:
+    """Generic bounding box to crop node that accepts a BBOXES list or JSON data."""
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "bboxes": ("BBOXES",),
+                "padding": ("INT", {"default": 4, "min": 0, "max": 1000}),
+                "min_width": ("INT", {"default": 20, "min": 1, "max": 4000}),
+                "min_height": ("INT", {"default": 10, "min": 1, "max": 4000}),
+            }
+        }
+    
+    RETURN_TYPES = ("IMAGE", "BBOXES", "INT")
+    RETURN_NAMES = ("cropped_images", "bboxes", "count")
+    FUNCTION = "crop_from_bboxes"
+    CATEGORY = "Sütterlin HTR/Detection"
+
+    def crop_from_bboxes(self, image, bboxes, padding, min_width, min_height):
+        if isinstance(bboxes, str):
+            try:
+                data = json.loads(bboxes)
+            except:
+                data = bboxes
+        else:
+            data = bboxes
+
+        quad_boxes = []
+        if isinstance(data, dict):
+            if "<OCR_WITH_REGION>" in data:
+                quad_boxes = data["<OCR_WITH_REGION>"].get("quad_boxes", [])
+            elif "quad_boxes" in data:
+                quad_boxes = data["quad_boxes"]
+            elif "bboxes" in data:
+                quad_boxes = data["bboxes"]
+        elif isinstance(data, list):
+            quad_boxes = data
+
+        pil_images = tensor2pil(image)
+        pil_img = pil_images[0]
+        img_w, img_h = pil_img.size
+
+        if len(quad_boxes) > 0 and isinstance(quad_boxes[0], (list, tuple)) and len(quad_boxes[0]) == 8:
+            parsed_bboxes = parse_quad_boxes(quad_boxes)
+        else:
+            parsed_bboxes = []
+            for box in quad_boxes:
+                if len(box) >= 4:
+                    parsed_bboxes.append((int(box[0]), int(box[1]), int(box[2]), int(box[3])))
+        
+        padded_bboxes = apply_padding(parsed_bboxes, padding, img_w, img_h)
+        filtered_bboxes = filter_bboxes(padded_bboxes, min_width, min_height)
+        
+        crops = crop_image(pil_img, filtered_bboxes)
+        
+        if len(crops) == 0:
+            empty_tensor = torch.zeros((1, 16, 16, 3), dtype=torch.float32)
+            return (empty_tensor, [], 0)
+            
+        cropped_tensor = pil2tensor(crops)
+        
+        return (cropped_tensor, filtered_bboxes, len(filtered_bboxes))
+

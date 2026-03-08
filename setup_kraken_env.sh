@@ -92,7 +92,31 @@ else
     "${VENV_DIR}/bin/pip" install kraken
 fi
 
-# ── Step 5: Verify installation ──────────────────────────────────────────────
+# ── Step 5: Patch kraken/blla.py for Python importlib.resources compatibility ─
+# kraken 6.x uses resources.files(__name__) inside blla.py (a module, not a
+# package), which raises TypeError: 'kraken.blla' is not a package on Python
+# 3.10+.  The fix is to use resources.files('kraken') instead, since blla.mlmodel
+# lives in the kraken/ package directory.
+echo ""
+echo "→ Patching kraken/blla.py for importlib.resources compatibility..."
+
+BLLA_PY=$("${VENV_DIR}/bin/python" -c "import kraken.blla; print(kraken.blla.__file__)" 2>/dev/null)
+if [ -n "${BLLA_PY}" ]; then
+    if grep -q "resources.files(__name__)" "${BLLA_PY}"; then
+        sed -i "s/resources\.files(__name__)/resources.files('kraken')/g" "${BLLA_PY}"
+        # Remove stale bytecode cache so Python picks up the patched source
+        BLLA_PYC="${BLLA_PY%%.py}.cpython-$(python3 -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")').pyc"
+        BLLA_PYCACHE="$(dirname "${BLLA_PY}")/__pycache__/$(basename "${BLLA_PY%%.py}").cpython-"*".pyc"
+        rm -f ${BLLA_PYCACHE} 2>/dev/null || true
+        echo "✓ Patched: resources.files(__name__) → resources.files('kraken') in ${BLLA_PY}"
+    else
+        echo "✓ blla.py already patched or uses different API — no change needed."
+    fi
+else
+    echo "⚠ Could not locate kraken/blla.py — skipping patch."
+fi
+
+# ── Step 6: Verify installation ──────────────────────────────────────────────
 echo ""
 echo "→ Verifying installation..."
 

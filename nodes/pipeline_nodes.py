@@ -44,7 +44,12 @@ class SuetterlinHTRComplete:
         model_dtype = next(fl2_model.parameters()).dtype
         
         inputs["input_ids"] = inputs["input_ids"].to(device)
-        inputs["pixel_values"] = inputs["pixel_values"].to(device, dtype=model_dtype)
+        
+        # Only cast to model's dtype if it's a floating point type (fp16, bf16, fp32)
+        if model_dtype in [torch.float16, torch.bfloat16, torch.float32]:
+            inputs["pixel_values"] = inputs["pixel_values"].to(device, dtype=model_dtype)
+        else:
+            inputs["pixel_values"] = inputs["pixel_values"].to(device)
         
         # Monkeypatch prepare_inputs_for_generation to handle EncoderDecoderCache vs tuple
         original_prepare = fl2_model.language_model.prepare_inputs_for_generation
@@ -95,11 +100,14 @@ class SuetterlinHTRComplete:
             transformers_logger.setLevel(old_level)
             
         generated_text = fl2_processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+        print(f"[DEBUG Florence-2] Raw generated text:\n{generated_text}\n")
+        
         parsed_answer = fl2_processor.post_process_generation(
             generated_text, 
             task=task_prompt, 
             image_size=(pil_img.width, pil_img.height)
         )
+        print(f"[DEBUG Florence-2] Parsed answer dict keys: {list(parsed_answer.keys()) if isinstance(parsed_answer, dict) else type(parsed_answer)}")
         
         florence2_data = parsed_answer
         
@@ -107,15 +115,22 @@ class SuetterlinHTRComplete:
         quad_boxes = []
         labels = []
         if isinstance(florence2_data, dict) and "<OCR_WITH_REGION>" in florence2_data:
-            quad_boxes = florence2_data["<OCR_WITH_REGION>"].get("quad_boxes", [])
-            labels = florence2_data["<OCR_WITH_REGION>"].get("labels", [])
+            ocr_data = florence2_data["<OCR_WITH_REGION>"]
+            quad_boxes = ocr_data.get("quad_boxes", [])
+            labels = ocr_data.get("labels", [])
+            print(f"[DEBUG Florence-2] Found {len(quad_boxes)} quad_boxes and {len(labels)} labels in <OCR_WITH_REGION>.")
+        else:
+            print(f"[DEBUG Florence-2] WARNING: <OCR_WITH_REGION> key not found in parsed_answer!")
             
         img_w, img_h = pil_img.size
         
         bboxes = parse_quad_boxes(quad_boxes)
+        print(f"[DEBUG Florence-2] Parsed {len(bboxes)} bounding boxes from quad_boxes.")
+        
         padded_bboxes = apply_padding(bboxes, padding, img_w, img_h)
         # Assuming reasonable minimums for lines
         filtered_bboxes = filter_bboxes(padded_bboxes, 20, 10)
+        print(f"[DEBUG Florence-2] Bounding boxes after padding and filtering: {len(filtered_bboxes)} (from {len(bboxes)})")
         
         crops = crop_image(pil_img, filtered_bboxes)
         
@@ -128,8 +143,9 @@ class SuetterlinHTRComplete:
             annotated_image = pil2tensor([ann_pil])
             
         if not crops:
+            print("[DEBUG Florence-2] No text regions detected or remaining after filtering. Returning empty results.")
             empty_tensor = torch.zeros((1, 16, 16, 3), dtype=torch.float32)
-            return ("", [], annotated_image, empty_tensor, {"error": "No lines detected"})
+            return ("No text regions detected by Florence-2", [], annotated_image, empty_tensor, {"error": "No lines detected"})
             
         cropped_tensor = pil2tensor(crops)
         

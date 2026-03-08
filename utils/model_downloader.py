@@ -10,18 +10,25 @@ class TrOCRModelDownloader:
     MODELS = {
         "dh-unibe/trocr-kurrent": {
             "repo_id": "dh-unibe/trocr-kurrent",
-            "description": "19th century German Kurrent/Sütterlin",
+            "description": "19th century German Kurrent/Sütterlin (CER 2.7%)",
             "cer": 2.7,
             "size_mb": 245,
             "century": "19th"
         },
         "dh-unibe/trocr-kurrent-XVI-XVII": {
             "repo_id": "dh-unibe/trocr-kurrent-XVI-XVII",
-            "description": "16th-18th century German Kurrent",
+            "description": "16th-18th century German Kurrent (CER 5.4%)",
             "cer": 5.4,
             "size_mb": 245,
             "century": "16th-18th"
-        }
+        },
+        "dh-unibe/trocr-medieval-escriptmask": {
+            "repo_id": "dh-unibe/trocr-medieval-escriptmask",
+            "description": "Medieval Latin manuscripts (eScriptorium mask-based)",
+            "cer": None,
+            "size_mb": 245,
+            "century": "medieval"
+        },
     }
     
     @staticmethod
@@ -50,7 +57,41 @@ class TrOCRModelDownloader:
         return has_required and has_model
     
     @staticmethod
-    def download_model(model_name: str, 
+    def _ensure_tokenizer_vocab(model_path: Path) -> None:
+        """
+        Ensure the tokenizer vocabulary files are present in model_path.
+
+        dh-unibe/trocr-kurrent (and similar fine-tuned models) omit vocab.json
+        and merges.txt from their HuggingFace repo because they rely on the
+        base roberta-large tokenizer.  When those files are missing the
+        RobertaTokenizer loads with only 5 special tokens and produces empty
+        transcriptions.  This method downloads them from roberta-large if needed.
+        """
+        vocab_file = model_path / "vocab.json"
+        merges_file = model_path / "merges.txt"
+
+        if vocab_file.exists() and merges_file.exists():
+            return  # already present
+
+        print(f"[TrOCR] Tokenizer vocab files missing — fetching from roberta-large...")
+        try:
+            from huggingface_hub import hf_hub_download
+            for filename in ("vocab.json", "merges.txt"):
+                dest = model_path / filename
+                if not dest.exists():
+                    local = hf_hub_download(
+                        repo_id="roberta-large",
+                        filename=filename,
+                        local_dir=str(model_path),
+                        local_dir_use_symlinks=False,
+                    )
+                    print(f"[TrOCR] Downloaded {filename} → {dest}")
+        except Exception as e:
+            print(f"[TrOCR] WARNING: Could not fetch tokenizer vocab: {e}")
+            print("[TrOCR] Transcription may produce empty output until vocab files are present.")
+
+    @staticmethod
+    def download_model(model_name: str,
                       target_dir: Optional[str] = None,
                       force: bool = False) -> Tuple[bool, str, Dict]:
         """
@@ -64,6 +105,8 @@ class TrOCRModelDownloader:
             
             # Check if already exists
             if not force and TrOCRModelDownloader.is_model_downloaded(model_name):
+                # Still ensure vocab files are present even for cached models
+                TrOCRModelDownloader._ensure_tokenizer_vocab(model_path)
                 return True, f"✓ Model already exists at {model_path}", {
                     "path": str(model_path),
                     "cached": True
@@ -84,6 +127,9 @@ class TrOCRModelDownloader:
                 resume_download=True,
                 ignore_patterns=["*.msgpack", "*.h5", "*.ot"]  # Skip unnecessary files
             )
+
+            # Ensure tokenizer vocab files are present (not included in fine-tuned repos)
+            TrOCRModelDownloader._ensure_tokenizer_vocab(model_path)
             
             # Verify download
             if TrOCRModelDownloader.is_model_downloaded(model_name):

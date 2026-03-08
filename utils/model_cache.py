@@ -18,9 +18,13 @@ class TrOCRModelCache:
             
             if not model_path.exists():
                 raise FileNotFoundError(f"Model {model_name} not found at {model_path}.")
-                
+
+            # Ensure tokenizer vocab files are present (fine-tuned models often
+            # omit vocab.json/merges.txt and rely on the base roberta-large vocab)
+            TrOCRModelDownloader._ensure_tokenizer_vocab(model_path)
+
             print(f"Loading {model_name} to {device}...")
-            processor = TrOCRProcessor.from_pretrained(str(model_path))
+            processor = TrOCRProcessor.from_pretrained(str(model_path), use_fast=False)
             model = VisionEncoderDecoderModel.from_pretrained(str(model_path))
             model = model.to(device).eval()
             cls._models[model_name] = (processor, model)

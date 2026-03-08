@@ -43,15 +43,55 @@ def _tensor2pil(image_tensor):
         return [Image.fromarray(arr, mode="RGB")]
 
 
+# Target height for TrOCR line images (pixels).  TrOCR's ViT encoder expects
+# square 384×384 patches, but the feature-extractor resizes internally.
+# A fixed height of 64 px keeps text legible while normalising line heights.
+_TROCR_LINE_HEIGHT = 64
+
+
+def _resize_to_line_height(pil_img, target_h=_TROCR_LINE_HEIGHT):
+    """Scale a PIL image so its height == target_h, preserving aspect ratio.
+    Returns a white-background RGB image of size (target_h, scaled_w).
+    """
+    w, h = pil_img.size
+    if h == 0:
+        return Image.new("RGB", (target_h, target_h), (255, 255, 255))
+    scale = target_h / h
+    new_w = max(1, int(round(w * scale)))
+    # LANCZOS gives best quality for downscaling text
+    return pil_img.convert("RGB").resize((new_w, target_h), Image.LANCZOS)
+
+
 def _pil2tensor(images):
-    """Convert list of PIL Images → ComfyUI IMAGE tensor (B, H, W, C) float32 [0,1]."""
-    tensors = []
-    for img in images:
-        arr = np.array(img.convert("RGB")).astype(np.float32) / 255.0
-        tensors.append(torch.from_numpy(arr))
-    if not tensors:
-        return torch.zeros(1, 16, 16, 3, dtype=torch.float32)
-    return torch.stack(tensors)
+    """Convert list of PIL Images → ComfyUI IMAGE tensor (B, H, W, C) float32 [0,1].
+
+    Each image is first scaled to _TROCR_LINE_HEIGHT so that text fills the
+    full height of every crop.  Images are then right-padded (white) to the
+    maximum width in the batch before stacking.  This avoids the problem of
+    tiny text surrounded by large black areas when crops have very different
+    sizes.
+    """
+    if not images:
+        return torch.zeros(1, _TROCR_LINE_HEIGHT, _TROCR_LINE_HEIGHT, 3, dtype=torch.float32)
+
+    # 1. Normalise height
+    resized = [_resize_to_line_height(img) for img in images]
+
+    # 2. Pad width to maximum
+    max_w = max(img.size[0] for img in resized)
+
+    arrays = []
+    for img in resized:
+        arr = np.array(img).astype(np.float32) / 255.0
+        w = arr.shape[1]
+        if w < max_w:
+            # White (1.0) padding on the right
+            pad = np.ones((_TROCR_LINE_HEIGHT, max_w, 3), dtype=np.float32)
+            pad[:, :w, :] = arr
+            arr = pad
+        arrays.append(torch.from_numpy(arr))
+
+    return torch.stack(arrays)
 
 
 def _empty_image_tensor():
@@ -219,12 +259,20 @@ class KrakenLineSegmentation:
 
             print(f"[KrakenLineSegmentation] Running: {' '.join(cmd)}", flush=True)
 
+            # Build a clean environment: inherit OS vars but strip Python path
+            # overrides so the kraken_env venv uses only its own site-packages.
+            clean_env = os.environ.copy()
+            for _var in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"):
+                clean_env.pop(_var, None)
+            clean_env["PYTHONNOUSERSITE"] = "1"
+
             try:
                 proc = subprocess.run(
                     cmd,
                     capture_output=True,
                     text=True,
                     timeout=120,
+                    env=clean_env,
                 )
             except subprocess.TimeoutExpired:
                 raise RuntimeError(

@@ -23,9 +23,18 @@ class TextOutput:
         file_path = ""
         if save_to_file and output_path:
             file_path = output_path
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(os.path.abspath(file_path)) or '.', exist_ok=True)
-            
+            # If output_path is a directory (or ends with a separator), append a default filename
+            if os.path.isdir(file_path) or file_path.endswith(os.sep) or file_path.endswith("/"):
+                ext = {"json": ".json", "markdown": ".md"}.get(format, ".txt")
+                file_path = os.path.join(file_path.rstrip("/\\"), f"transcription{ext}")
+            # Ensure the file has an extension; if not, add one
+            elif not os.path.splitext(file_path)[1]:
+                ext = {"json": ".json", "markdown": ".md"}.get(format, ".txt")
+                file_path = file_path + ext
+            # Ensure parent directory exists
+            parent_dir = os.path.dirname(os.path.abspath(file_path))
+            os.makedirs(parent_dir, exist_ok=True)
+
             with open(file_path, "w", encoding="utf-8") as f:
                 if format == "json":
                     json.dump({"text": text}, f, ensure_ascii=False, indent=2)
