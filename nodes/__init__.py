@@ -73,4 +73,11 @@ try:
 except Exception as e:
     logger.warning(f"Could not import llm_nodes: {e}")
 
+try:
+    from .kraken_nodes import KrakenLineSegmentation
+    NODE_CLASS_MAPPINGS["KrakenLineSegmentation"] = KrakenLineSegmentation
+    NODE_DISPLAY_NAME_MAPPINGS["KrakenLineSegmentation"] = "Kraken Line Segmentation"
+except Exception as e:
+    logger.warning(f"Could not import kraken_nodes: {e}")
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
