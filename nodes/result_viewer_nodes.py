@@ -60,7 +60,7 @@ class LineTranscriptionViewer:
                 "font_size": ("INT", {"default": 20, "min": 10, "max": 48,
                                       "tooltip": "Font size for transcription text."}),
                 "line_height_px": ("INT", {"default": 80, "min": 40, "max": 200,
-                                           "tooltip": "Height of each row in the grid (px)."}),
+                                           "tooltip": "Minimum height of each row in the grid (px); expands to fit wrapped text."}),
                 "max_width": ("INT", {"default": 1600, "min": 400, "max": 4096,
                                       "tooltip": "Max width of output image (px)."}),
                 "show_confidence": ("BOOLEAN", {"default": False,
@@ -125,45 +125,35 @@ class LineTranscriptionViewer:
             pri_col_width  = max_width - img_col_width - 20  # rest for text + padding
             alt_col_width  = 0
 
-        row_h   = line_height_px + 10   # 10px padding between rows
-        total_h = row_h * B + 20        # 20px top/bottom margin
-        if show_comparison:
-            total_h += HEADER_H         # extra space for header row
+        # ── Helper: word-wrap text to fit within max_col_width pixels ─────────
+        def wrap_text(text, font, draw, max_col_width, padding=8):
+            """Word-wrap text to fit within max_col_width pixels."""
+            words = text.split()
+            if not words:
+                return [""]
 
-        # ── Helper: truncate text to fit within max_px width ─────────────────
-        def fit_text(text: str, fnt, max_px: int) -> str:
-            """Return text truncated with '…' so it fits within max_px pixels."""
-            if not text:
-                return text
-            try:
-                w = fnt.getlength(text)
-            except AttributeError:
-                w = fnt.getsize(text)[0]  # Pillow < 9.2 fallback
-            if w <= max_px:
-                return text
-            ellipsis = "…"
-            try:
-                ew = fnt.getlength(ellipsis)
-            except AttributeError:
-                ew = fnt.getsize(ellipsis)[0]
-            budget = max_px - ew
-            # Binary-search the longest prefix that fits
-            lo, hi = 0, len(text)
-            while lo < hi:
-                mid = (lo + hi + 1) // 2
+            lines_out = []
+            current_line = ""
+            available_width = max_col_width - padding * 2
+
+            for word in words:
+                test_line = (current_line + " " + word).strip()
                 try:
-                    pw = fnt.getlength(text[:mid])
+                    w = draw.textlength(test_line, font=font)
                 except AttributeError:
-                    pw = fnt.getsize(text[:mid])[0]
-                if pw <= budget:
-                    lo = mid
-                else:
-                    hi = mid - 1
-            return text[:lo] + ellipsis
+                    w = font.getlength(test_line)
 
-        # Create white canvas
-        canvas = Image.new("RGB", (max_width, total_h), color=(255, 255, 255))
-        draw   = ImageDraw.Draw(canvas)
+                if w <= available_width:
+                    current_line = test_line
+                else:
+                    if current_line:
+                        lines_out.append(current_line)
+                    current_line = word
+
+            if current_line:
+                lines_out.append(current_line)
+
+            return lines_out if lines_out else [""]
 
         # Try to load a font, fall back to default
         try:
@@ -182,6 +172,58 @@ class LineTranscriptionViewer:
             font        = ImageFont.load_default()
             font_small  = font
             font_header = font
+
+        # ── First pass: compute per-row heights based on wrapped line counts ──
+        # We need a temporary draw surface to measure text widths.
+        # Use a small dummy image for measurement only.
+        _dummy = Image.new("RGB", (max_width, 1))
+        _draw_measure = ImageDraw.Draw(_dummy)
+
+        # Determine text column widths for wrapping
+        if show_comparison:
+            # alt column: from alt_x (img_col_width + 14) to sep2_x (img_col_width + alt_col_width + 10)
+            # primary column: from pri_x (sep2_x + 10) to max_width - 6
+            # Use approximate column widths for wrapping (confidence badge offset handled separately)
+            alt_wrap_width = alt_col_width - 14 - 6  # approx available width
+            pri_wrap_width = pri_col_width - 10 - 6  # approx available width
+        else:
+            # 2-column: text starts at img_col_width + 20 (+ 55 if confidence badge)
+            pri_wrap_width = pri_col_width - 20 - 6
+
+        line_spacing = font_size + 4  # pixels between wrapped lines
+
+        row_h = []  # per-row height (px)
+        for i in range(B):
+            text_line     = lines[i]     if i < len(lines)     else ""
+            alt_text_line = alt_lines[i] if i < len(alt_lines) else ""
+
+            if show_comparison:
+                # Account for confidence badge offset in alt column
+                _alt_w = alt_wrap_width
+                if show_confidence and i in conf_data:
+                    _alt_w = max(10, alt_wrap_width - 55)
+                pri_wrapped = wrap_text(text_line,     font, _draw_measure, pri_wrap_width)
+                alt_wrapped = wrap_text(alt_text_line, font, _draw_measure, _alt_w)
+                max_wrapped = max(len(pri_wrapped), len(alt_wrapped))
+            else:
+                # Account for confidence badge offset in primary column
+                _pri_w = pri_wrap_width
+                if show_confidence and i in conf_data:
+                    _pri_w = max(10, pri_wrap_width - 55)
+                pri_wrapped = wrap_text(text_line, font, _draw_measure, _pri_w)
+                max_wrapped = len(pri_wrapped)
+
+            # Row height: at least line_height_px, expanded to fit wrapped lines
+            needed_h = max_wrapped * line_spacing + 8
+            row_h.append(max(line_height_px, needed_h))
+
+        # ── Compute total canvas height ────────────────────────────────────────
+        header_offset = HEADER_H if show_comparison else 0
+        total_h = sum(row_h) + header_offset + 20  # 20px bottom margin
+
+        # ── Create white canvas ───────────────────────────────────────────────
+        canvas = Image.new("RGB", (max_width, total_h), color=(255, 255, 255))
+        draw   = ImageDraw.Draw(canvas)
 
         # ── Draw comparison header row ────────────────────────────────────────
         if show_comparison:
@@ -209,26 +251,27 @@ class LineTranscriptionViewer:
                 fill=(200, 200, 200), width=1
             )
 
-        # Row y-offset: push rows down by HEADER_H when comparison is active
-        y_offset = HEADER_H if show_comparison else 0
+        # ── Second pass: draw each row ────────────────────────────────────────
+        y_cursor = header_offset + 10  # running y position (top of current row)
 
         for i in range(B):
-            y_top = y_offset + 10 + i * row_h
+            y_top  = y_cursor
+            cur_rh = row_h[i]
 
             # ── Draw line image (left column) ─────────────────────────────────
             img_tensor = images[i]  # [H, W, 3]
             img_np     = (img_tensor.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
             pil_line   = Image.fromarray(img_np, mode="RGB")
 
-            # Scale to fit line_height_px while preserving aspect ratio
+            # Scale to fill cur_rh while preserving aspect ratio
             orig_w, orig_h = pil_line.size
             if orig_h > 0:
-                scale  = line_height_px / orig_h
-                new_w  = min(int(orig_w * scale), img_col_width)
+                scale  = cur_rh / orig_h
+                new_w  = min(int(orig_w * scale), img_col_width - 10)
                 new_w  = max(new_w, 1)
-                pil_line_scaled = pil_line.resize((new_w, line_height_px), Image.LANCZOS)
+                pil_line_scaled = pil_line.resize((new_w, cur_rh), Image.LANCZOS)
             else:
-                pil_line_scaled = Image.new("RGB", (img_col_width, line_height_px),
+                pil_line_scaled = Image.new("RGB", (img_col_width, cur_rh),
                                             (240, 240, 240))
 
             canvas.paste(pil_line_scaled, (5, y_top))
@@ -236,16 +279,13 @@ class LineTranscriptionViewer:
             # ── Separator after image column ──────────────────────────────────
             sep_x = img_col_width + 5
             draw.line(
-                [(sep_x, y_top), (sep_x, y_top + line_height_px)],
+                [(sep_x, y_top), (sep_x, y_top + cur_rh)],
                 fill=(200, 200, 200), width=1
             )
 
             # ── Transcription text ────────────────────────────────────────────
             text_line     = lines[i]     if i < len(lines)     else ""
             alt_text_line = alt_lines[i] if i < len(alt_lines) else ""
-
-            # Vertical centre for text within the row
-            text_y = y_top + (line_height_px - font_size) // 2
 
             if show_comparison:
                 # Determine whether LLM changed the line
@@ -271,23 +311,27 @@ class LineTranscriptionViewer:
                     draw.text((alt_x, y_top + 2), conf_text, fill=conf_color, font=font_small)
                     alt_x += 55
 
-                # Draw alt (pre-LLM) text — clipped to alt column width
+                # Draw alt (pre-LLM) text — word-wrapped within alt column
                 sep2_x = img_col_width + alt_col_width + 10
-                alt_max_px = sep2_x - alt_x - 6  # 6px right margin before separator
-                draw.text((alt_x, text_y), fit_text(alt_text_line, font, alt_max_px),
-                          fill=alt_color, font=font)
+                alt_max_col = sep2_x - alt_x - 6  # available column width
+                alt_wrapped = wrap_text(alt_text_line, font, draw, alt_max_col)
+                for j, wline in enumerate(alt_wrapped):
+                    y_text = y_top + 4 + j * line_spacing
+                    draw.text((alt_x, y_text), wline, fill=alt_color, font=font)
 
                 # Vertical separator between alt and primary columns
                 draw.line(
-                    [(sep2_x, y_top), (sep2_x, y_top + line_height_px)],
+                    [(sep2_x, y_top), (sep2_x, y_top + cur_rh)],
                     fill=(200, 200, 200), width=1
                 )
 
-                # Draw primary (LLM-corrected) text — clipped to primary column width
+                # Draw primary (LLM-corrected) text — word-wrapped within primary column
                 pri_x = sep2_x + 10
-                pri_max_px = max_width - pri_x - 6  # 6px right margin
-                draw.text((pri_x, text_y), fit_text(text_line, font, pri_max_px),
-                          fill=pri_color, font=font)
+                pri_max_col = max_width - pri_x - 6  # available column width
+                pri_wrapped = wrap_text(text_line, font, draw, pri_max_col)
+                for j, wline in enumerate(pri_wrapped):
+                    y_text = y_top + 4 + j * line_spacing
+                    draw.text((pri_x, y_text), wline, fill=pri_color, font=font)
 
             else:
                 # ── 2-column mode (original behaviour) ───────────────────────
@@ -306,14 +350,21 @@ class LineTranscriptionViewer:
                     draw.text((text_x, y_top + 2), conf_text, fill=conf_color, font=font_small)
                     text_x += 55
 
-                # Main transcription text — vertically centred in the row
-                draw.text((text_x, text_y), text_line, fill=(0, 0, 0), font=font)
+                # Main transcription text — word-wrapped within primary column
+                pri_max_col = max_width - text_x - 6
+                pri_wrapped = wrap_text(text_line, font, draw, pri_max_col)
+                for j, wline in enumerate(pri_wrapped):
+                    y_text = y_top + 4 + j * line_spacing
+                    draw.text((text_x, y_text), wline, fill=(0, 0, 0), font=font)
 
             # ── Row separator ─────────────────────────────────────────────────
             draw.line(
-                [(0, y_top + row_h - 2), (max_width, y_top + row_h - 2)],
+                [(0, y_top + cur_rh - 2), (max_width, y_top + cur_rh - 2)],
                 fill=(230, 230, 230), width=1
             )
+
+            # Advance cursor
+            y_cursor += cur_rh
 
         # ── Save if requested ─────────────────────────────────────────────────
         if save_to_file and output_path:

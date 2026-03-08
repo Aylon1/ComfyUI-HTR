@@ -1,3 +1,4 @@
+import re
 import torch
 import numpy as np
 from PIL import Image
@@ -11,6 +12,22 @@ def tensor2pil(image: torch.Tensor) -> Image.Image:
     if len(image.shape) == 4:
         image = image[0]
     return Image.fromarray(np.clip(255. * image.cpu().numpy(), 0, 255).astype(np.uint8))
+
+# Compiled once at module load for efficiency
+_XML_TAG_RE = re.compile(r"<[^>]+>")
+
+def _strip_xml_tags(text: str) -> str:
+    """Remove any XML/HTML tags from TrOCR output and collapse extra whitespace.
+
+    The trocr-kurrent model occasionally hallucinates TEI XML markup
+    (e.g. '<text><body><div xml:id="Ms_germ_fol_841" .../>') for lines
+    that contain manuscript header/folio markers.  Strip those tags so
+    only the plain-text content (if any) remains.
+    """
+    cleaned = _XML_TAG_RE.sub("", text)
+    # Collapse runs of whitespace left behind by removed tags
+    cleaned = " ".join(cleaned.split())
+    return cleaned
 
 class DownloadTrOCRModel:
     """Download TrOCR models from HuggingFace with progress tracking"""
@@ -225,8 +242,10 @@ class TrOCRInference:
             )
             
         generated_ids = outputs.sequences
-        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        
+        generated_text = _strip_xml_tags(
+            processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        )
+
         # Calculate confidence (mean max-softmax over generated tokens)
         confidence = 1.0  # default if no scores
         if outputs.scores:
@@ -311,7 +330,9 @@ class BatchTrOCRInference:
                 )
                 
             generated_ids = outputs.sequences
-            generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            generated_text = _strip_xml_tags(
+                processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            )
             lines.append(generated_text)
             
             # Confidence: mean max-softmax over generated tokens
