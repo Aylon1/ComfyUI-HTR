@@ -35,17 +35,42 @@ CALAMARI_ENV_PYTHON  = os.path.join(_PKG_DIR, "kraken_env", "bin", "python")
 
 CALAMARI_MODELS_DIR = "/mnt/tjkdata/comfyui2/ComfyUI/models/calamari"
 
+# ── Model registry ────────────────────────────────────────────────────────────
+#
+# IMPORTANT: calamari-ocr 2.x (installed in kraken_env) uses Keras .h5 format.
+# The chreul/19th-century-fraktur-OCR repo uses calamari 1.x TF1 SavedModel
+# format (.ckpt.data/.index/.meta) which is INCOMPATIBLE with calamari 2.x.
+#
+# For calamari 2.x, use models from qurator-data.de that ship .ckpt.h5 files.
+# The GT4HistOCR 2022 release is the standard calamari 2.x Fraktur model.
+#
+# chreul repo is kept in the registry for reference but marked as calamari 1.x
+# only — users who install calamari 1.x can use it.
+
 CALAMARI_MODEL_REGISTRY = {
+    "fraktur_gt4histocr": {
+        "display": "GT4HistOCR Fraktur (QURATOR, calamari 2.x) — Historical German Fraktur",
+        "local_subdir": "fraktur_gt4histocr/models",
+        # calamari 2.x compatible tar.gz from qurator-data.de
+        # Contains .ckpt.h5 Keras checkpoints
+        "download_url": "https://qurator-data.de/calamari-models/GT4HistOCR/2022-04-14T07_00+0200/model.tar.gz",
+        "calamari_version": 2,
+    },
     "fraktur19_chreul": {
-        "display": "Fraktur19 (chreul) — 19th century Fraktur, 5-model ensemble",
+        "display": "Fraktur19 (chreul, calamari 1.x ONLY) — 19th century Fraktur ensemble",
         "local_subdir": "fraktur19/models",
         "github_repo": "chreul/19th-century-fraktur-OCR",
-        "github_models_path": "models",  # subfolder in the repo
+        # Actual checkpoint path inside the repo (two levels below repo root)
+        # models/ → calamari/ → ensemble_best/*.ckpt.json
+        # NOTE: These are calamari 1.x TF1 format — incompatible with calamari 2.x
+        "github_models_path": "models/calamari/ensemble_best",
+        "calamari_version": 1,
     },
-    "gt4histocr_qurator": {
-        "display": "GT4HistOCR (QURATOR) — Historical OCR, broad coverage",
-        "local_subdir": "gt4histocr/models",
+    "gt4histocr_qurator_v1": {
+        "display": "GT4HistOCR (QURATOR 2019, calamari 1.x ONLY) — Historical OCR",
+        "local_subdir": "gt4histocr_v1/models",
         "download_url": "https://qurator-data.de/calamari-models/GT4HistOCR/2019-12-11T11_10+0100/model.tar.xz",
+        "calamari_version": 1,
     },
 }
 
@@ -177,62 +202,116 @@ def _run_calamari_subprocess(numpy_images, checkpoints_dir):
 # ── Download helper (module-level) ────────────────────────────────────────────
 
 def _download_calamari_model(model_key, models_base_dir, registry):
-    """Download Calamari model files to the correct location."""
+    """Download Calamari model files to the correct location.
+
+    Primary method: git clone --depth=1 (avoids GitHub API rate limits and
+    correctly handles repos where model files are nested in subdirectories).
+
+    The chreul/19th-century-fraktur-OCR repo structure is:
+        models/calamari/ensemble_best/*.ckpt.json   ← actual checkpoints
+        models/calamari/single_best/*.ckpt.json
+    The GitHub Contents API call to "models/" returns only two directory
+    entries (calamari/, ocropus/) — both type=dir — so the old file-loop
+    matched nothing and downloaded zero files silently.
+
+    Fallback: urllib direct download via raw.githubusercontent.com (used
+    when git is not available).
+    """
+    import shutil
     import urllib.request
-    import json as json_mod
 
     target_dir = os.path.join(models_base_dir, registry["local_subdir"])
     os.makedirs(target_dir, exist_ok=True)
 
     if "github_repo" in registry:
-        # Download from GitHub
         repo = registry["github_repo"]
         models_path = registry.get("github_models_path", "models")
+        repo_dir = os.path.join(models_base_dir, f"_repo_{model_key}")
 
-        # Try GitHub Contents API first
-        api_url = f"https://api.github.com/repos/{repo}/contents/{models_path}"
-        print(f"[LoadCalamariFrakturModel] Fetching file list from {api_url}")
-
-        try:
-            req = urllib.request.Request(api_url, headers={"User-Agent": "ComfyUI-HTR"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                files = json_mod.loads(resp.read().decode())
-
-            for f in files:
-                if f["type"] == "file":
-                    fname = f["name"]
-                    furl = f["download_url"]
-                    dest = os.path.join(target_dir, fname)
-                    if not os.path.exists(dest):
-                        print(f"[LoadCalamariFrakturModel] Downloading {fname}...")
-                        urllib.request.urlretrieve(furl, dest)
-                    else:
-                        print(f"[LoadCalamariFrakturModel] Already exists: {fname}")
-
-        except Exception as e:
-            print(f"[LoadCalamariFrakturModel] GitHub API failed ({e}), trying direct URLs...")
-            # Fallback: try known file patterns via raw.githubusercontent.com
-            base_raw = f"https://raw.githubusercontent.com/{repo}/master/{models_path}"
-            # Try to get tree listing via alternative API
-            tree_url = f"https://api.github.com/repos/{repo}/git/trees/master?recursive=1"
+        # ── Primary: git clone ────────────────────────────────────────────
+        git_ok = False
+        if not os.path.isdir(repo_dir):
+            print(f"[LoadCalamariFrakturModel] git clone --depth=1 "
+                  f"https://github.com/{repo}.git → {repo_dir}")
             try:
-                req2 = urllib.request.Request(tree_url, headers={"User-Agent": "ComfyUI-HTR"})
-                with urllib.request.urlopen(req2, timeout=30) as resp2:
-                    tree = json_mod.loads(resp2.read().decode())
-                for item in tree.get("tree", []):
-                    if item["path"].startswith(models_path + "/") and item["type"] == "blob":
-                        fname = os.path.basename(item["path"])
-                        furl = f"{base_raw}/{fname}"
+                result = subprocess.run(
+                    ["git", "clone", "--depth=1",
+                     f"https://github.com/{repo}.git", repo_dir],
+                    capture_output=True, text=True, timeout=600,
+                )
+                if result.returncode == 0:
+                    git_ok = True
+                    print(f"[LoadCalamariFrakturModel] Clone succeeded.")
+                else:
+                    print(f"[LoadCalamariFrakturModel] git clone failed "
+                          f"(rc={result.returncode}): {result.stderr.strip()}")
+            except FileNotFoundError:
+                print("[LoadCalamariFrakturModel] git not found on PATH.")
+            except subprocess.TimeoutExpired:
+                print("[LoadCalamariFrakturModel] git clone timed out after 600 s.")
+            except Exception as exc:
+                print(f"[LoadCalamariFrakturModel] git clone error: {exc}")
+        else:
+            git_ok = True
+            print(f"[LoadCalamariFrakturModel] Repo already cloned at {repo_dir}")
+
+        if git_ok:
+            src_dir = os.path.join(repo_dir, models_path)
+            if os.path.isdir(src_dir):
+                copied = 0
+                for fname in os.listdir(src_dir):
+                    src = os.path.join(src_dir, fname)
+                    dst = os.path.join(target_dir, fname)
+                    if os.path.isfile(src) and not os.path.exists(dst):
+                        print(f"[LoadCalamariFrakturModel] Copying {fname}...")
+                        shutil.copy2(src, dst)
+                        copied += 1
+                    elif os.path.isfile(src):
+                        print(f"[LoadCalamariFrakturModel] Already exists: {fname}")
+                print(f"[LoadCalamariFrakturModel] Copied {copied} new file(s) "
+                      f"from cloned repo.")
+            else:
+                raise RuntimeError(
+                    f"Expected model path not found in cloned repo: {src_dir}\n"
+                    f"Check github_models_path in CALAMARI_MODEL_REGISTRY."
+                )
+        else:
+            # ── Fallback: urllib via raw.githubusercontent.com ────────────
+            # This only works for files ≤100 MB; requires knowing filenames.
+            print("[LoadCalamariFrakturModel] Falling back to urllib download "
+                  "(requires known filenames).")
+            import json as json_mod
+            api_url = (f"https://api.github.com/repos/{repo}/contents/{models_path}")
+            print(f"[LoadCalamariFrakturModel] Fetching file list from {api_url}")
+            try:
+                req = urllib.request.Request(
+                    api_url, headers={"User-Agent": "ComfyUI-HTR"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    files = json_mod.loads(resp.read().decode())
+                downloaded = 0
+                for f in files:
+                    if f.get("type") == "file" and f.get("download_url"):
+                        fname = f["name"]
                         dest = os.path.join(target_dir, fname)
                         if not os.path.exists(dest):
                             print(f"[LoadCalamariFrakturModel] Downloading {fname}...")
-                            urllib.request.urlretrieve(furl, dest)
-            except Exception as e2:
-                print(f"[LoadCalamariFrakturModel] Tree API also failed: {e2}")
-                raise RuntimeError(f"Could not download Calamari model from GitHub: {e2}")
+                            urllib.request.urlretrieve(f["download_url"], dest)
+                            downloaded += 1
+                if downloaded == 0 and not any(
+                    f.endswith(".ckpt.json")
+                    for f in os.listdir(target_dir)
+                ):
+                    raise RuntimeError(
+                        f"GitHub API returned no downloadable files at {api_url}. "
+                        f"Install git to use the clone-based download."
+                    )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Both git clone and urllib fallback failed for {repo}: {exc}"
+                ) from exc
 
     elif "download_url" in registry:
-        # Download tar.xz
+        # tar.gz or tar.xz download (e.g. GT4HistOCR QURATOR model)
         import tarfile
         url = registry["download_url"]
         fname = url.split("/")[-1]
@@ -240,7 +319,16 @@ def _download_calamari_model(model_key, models_base_dir, registry):
         print(f"[LoadCalamariFrakturModel] Downloading {fname}...")
         urllib.request.urlretrieve(url, tmp_path)
         print(f"[LoadCalamariFrakturModel] Extracting {fname}...")
-        with tarfile.open(tmp_path, "r:xz") as tar:
+        # Auto-detect compression: .tar.gz or .tar.xz
+        if fname.endswith(".tar.gz") or fname.endswith(".tgz"):
+            mode = "r:gz"
+        elif fname.endswith(".tar.xz"):
+            mode = "r:xz"
+        elif fname.endswith(".tar.bz2"):
+            mode = "r:bz2"
+        else:
+            mode = "r:*"  # auto-detect
+        with tarfile.open(tmp_path, mode) as tar:
             tar.extractall(target_dir)
         os.remove(tmp_path)
 
@@ -345,7 +433,12 @@ class CalamariFrakturNode:
                 params = PredictorParams()
                 params.silent = True
                 post_init(params)
-                fresh_predictor = Predictor.from_checkpoint(params=params, checkpoint=checkpoints)
+                # from_checkpoint() takes a single str path; strip .json suffix
+                # (SavedCalamariModel internally appends it back)
+                ckpt_path = checkpoints[0]
+                if ckpt_path.endswith(".json"):
+                    ckpt_path = ckpt_path[:-5]
+                fresh_predictor = Predictor.from_checkpoint(params=params, checkpoint=ckpt_path)
 
                 for img_np in numpy_images:
                     try:
@@ -684,10 +777,7 @@ class LoadCalamariFrakturModel:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": ([
-                    "fraktur19_chreul",
-                    "gt4histocr_qurator",
-                ],),
+                "model": (list(CALAMARI_MODEL_REGISTRY.keys()),),
                 "models_base_dir": ("STRING", {
                     "default": CALAMARI_MODELS_DIR
                 }),

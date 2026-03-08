@@ -62,11 +62,40 @@ def run_prediction(checkpoints_dir, images_b64_list):
 
     print(f"[calamari_worker] Found {len(checkpoints)} checkpoint(s).", file=sys.stderr)
 
+    # Predictor.from_checkpoint() takes a single checkpoint path string
+    # (the .ckpt.json path, which SavedCalamariModel strips the .json from).
+    # For a voting ensemble, load each checkpoint separately and combine
+    # predictions, or just use the first checkpoint for single-model mode.
+    # The calamari API for voting ensemble uses a list via MultiPredictor.
     try:
+        from calamari_ocr.ocr.predict.predictor import MultiPredictor
         params = PredictorParams()
         params.silent = True
         post_init(params)
-        predictor = Predictor.from_checkpoint(params=params, checkpoint=checkpoints)
+        # MultiPredictor accepts a list of checkpoint paths for voting ensemble
+        predictor = MultiPredictor.from_paths(
+            checkpoints=checkpoints,
+            predictor_params=params,
+        )
+        use_multi = True
+        print(f"[calamari_worker] Loaded MultiPredictor with {len(checkpoints)} models.",
+              file=sys.stderr)
+    except (ImportError, AttributeError, TypeError):
+        # Fallback: single checkpoint (first one)
+        use_multi = False
+        try:
+            params = PredictorParams()
+            params.silent = True
+            post_init(params)
+            # Strip .json suffix — SavedCalamariModel expects path without .json
+            ckpt_path = checkpoints[0]
+            if ckpt_path.endswith(".json"):
+                ckpt_path = ckpt_path[:-5]
+            predictor = Predictor.from_checkpoint(params=params, checkpoint=ckpt_path)
+            print(f"[calamari_worker] Loaded single Predictor from {ckpt_path}",
+                  file=sys.stderr)
+        except Exception as e:
+            return {"error": f"Failed to load Calamari predictor: {e}"}
     except Exception as e:
         return {"error": f"Failed to load Calamari predictor: {e}"}
 
