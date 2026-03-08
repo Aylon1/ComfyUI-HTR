@@ -1,0 +1,118 @@
+{
+  "_comment": "TTA Ensemble HTR workflow: LoadImage → KrakenLineSegmentation → PreprocessLineImages → TTAEnsembleTrOCR → TextOutput. Node wiring: 1→2(image), 2→3(cropped_lines), 4→5(model), 3→5(preprocessed_images), 5→6(transcription), 2→7(annotated_image preview).",
+  "1": {
+    "inputs": {
+      "image": "example_suetterlin.jpg",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Handwriting Image"
+    }
+  },
+  "2": {
+    "inputs": {
+      "image": [
+        "1",
+        0
+      ],
+      "device": "auto",
+      "model": "default",
+      "padding": 4,
+      "min_width": 20,
+      "min_height": 10
+    },
+    "class_type": "KrakenLineSegmentation",
+    "_meta": {
+      "title": "Kraken Line Segmentation (BLLA)",
+      "note": "Outputs: [0]=cropped_lines (IMAGE batch), [1]=bboxes (JSON), [2]=count (INT), [3]=annotated_image (IMAGE)"
+    }
+  },
+  "3": {
+    "inputs": {
+      "images": [
+        "2",
+        0
+      ],
+      "binarization_method": "otsu",
+      "invert_mode": "auto",
+      "contrast_enhance": 1.2,
+      "sharpen": false,
+      "deskew": false
+    },
+    "class_type": "PreprocessLineImages",
+    "_meta": {
+      "title": "Preprocess Line Images",
+      "note": "Normalises line crops to clean black-on-white for TrOCR. Receives cropped_lines from KrakenLineSegmentation output [0]."
+    }
+  },
+  "4": {
+    "inputs": {
+      "model_name": "trocr-kurrent",
+      "device": "auto",
+      "dtype": "auto",
+      "auto_download": true
+    },
+    "class_type": "LoadTrOCRModel",
+    "_meta": {
+      "title": "Load TrOCR Model (Kurrent/Sütterlin)"
+    }
+  },
+  "5": {
+    "inputs": {
+      "images": [
+        "3",
+        0
+      ],
+      "trocr_model": [
+        "4",
+        0
+      ],
+      "num_beams": 5,
+      "max_new_tokens": 128,
+      "no_repeat_ngram_size": 3,
+      "use_original": true,
+      "use_slight_blur": true,
+      "use_sharpen": true,
+      "use_contrast_up": true,
+      "use_contrast_down": true,
+      "use_rotate_cw": true,
+      "use_rotate_ccw": true,
+      "join_lines": true
+    },
+    "class_type": "TTAEnsembleTrOCR",
+    "_meta": {
+      "title": "TTA Ensemble TrOCR",
+      "note": "Outputs: [0]=transcription (STRING, newline-joined winners), [1]=all_hypotheses_json (STRING, full JSON for LLM correction). Receives preprocessed_images from PreprocessLineImages [0] and model from LoadTrOCRModel [0]."
+    }
+  },
+  "6": {
+    "inputs": {
+      "text": [
+        "5",
+        0
+      ],
+      "save_to_file": false,
+      "output_path": "transcription_tta.txt",
+      "format": "txt"
+    },
+    "class_type": "TextOutput",
+    "_meta": {
+      "title": "Transcription Output",
+      "note": "Set save_to_file=true and output_path to a filename (e.g. transcription_tta.txt) to save results to disk. Receives transcription from TTAEnsembleTrOCR output [0]."
+    }
+  },
+  "7": {
+    "inputs": {
+      "images": [
+        "2",
+        3
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "Annotated Lines Preview",
+      "note": "Shows detected line polygons overlaid on the original image. Uses KrakenLineSegmentation output [3]=annotated_image."
+    }
+  }
+}
