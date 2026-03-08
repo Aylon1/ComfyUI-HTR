@@ -164,12 +164,13 @@ class CalamariFrakturNode:
                 "voting": ("BOOLEAN", {"default": True}),
             },
             "optional": {
+                "calamari_model": ("CALAMARI_MODEL",),
                 "force_cpu": ("BOOLEAN", {"default": False}),
             },
         }
 
     def run_calamari(self, images: torch.Tensor, calamari_checkpoints_dir: str,
-                     voting: bool, force_cpu: bool = False):
+                     voting: bool, calamari_model=None, force_cpu: bool = False):
         # 1. Convert tensor → PIL → grayscale numpy arrays
         pil_images = _tensor_to_pil_list(images)
         numpy_images = []
@@ -180,28 +181,34 @@ class CalamariFrakturNode:
                 gray = 255 - gray
             numpy_images.append(gray)
 
-        print(f"[CalamariFraktur] Processing {len(numpy_images)} line(s) from "
-              f"{calamari_checkpoints_dir}", flush=True)
+        # Resolve predictor and effective checkpoints_dir from optional calamari_model input
+        if calamari_model is not None:
+            if isinstance(calamari_model, str):
+                # LoadCalamariFrakturModel returned a path string (subprocess fallback)
+                checkpoints_dir = calamari_model
+                predictor = None
+                print(f"[CalamariFraktur] calamari_model is a path string → subprocess mode: "
+                      f"{checkpoints_dir}", flush=True)
+            else:
+                # It's a live Predictor object — use it directly
+                predictor = calamari_model
+                checkpoints_dir = calamari_checkpoints_dir
+                print(f"[CalamariFraktur] Using pre-loaded predictor from LoadCalamariFrakturModel "
+                      f"({len(numpy_images)} line(s))", flush=True)
+        else:
+            predictor = None
+            checkpoints_dir = calamari_checkpoints_dir
 
-        # 2. Try in-process Calamari first
+        print(f"[CalamariFraktur] Processing {len(numpy_images)} line(s) from "
+              f"{checkpoints_dir}", flush=True)
+
+        # 2. Try in-process Calamari (pre-loaded predictor or load fresh)
         results = []
         confidences = []
         used_subprocess = False
 
-        try:
-            from glob import glob
-            from calamari_ocr.ocr.predict.predictor import Predictor, PredictorParams
-            from tfaip.util.tfaipargparse import post_init
-
-            checkpoints = glob(os.path.join(calamari_checkpoints_dir, "*.ckpt.json"))
-            if not checkpoints:
-                raise ImportError(f"No .ckpt.json checkpoints found in {calamari_checkpoints_dir}")
-
-            params = PredictorParams()
-            params.silent = True
-            post_init(params)
-            predictor = Predictor.from_checkpoint(params=params, checkpoint=checkpoints)
-
+        if predictor is not None:
+            # Fast path: use the pre-loaded predictor directly
             for img_np in numpy_images:
                 try:
                     result = list(predictor.predict_raw([img_np]))
@@ -210,26 +217,54 @@ class CalamariFrakturNode:
                         float(getattr(result[0].outputs, "avg_char_probability", 0.0))
                     )
                 except Exception as e:
-                    print(f"[CalamariFraktur] In-process inference error: {e}", flush=True)
+                    print(f"[CalamariFraktur] Pre-loaded predictor inference error: {e}", flush=True)
                     results.append("")
                     confidences.append(0.0)
-
-        except ImportError as e:
-            print(f"[CalamariFraktur] calamari_ocr not available in-process ({e}); "
-                  "falling back to subprocess.", flush=True)
-            used_subprocess = True
-            results, confidences = _run_calamari_subprocess(numpy_images, calamari_checkpoints_dir)
-
-        except Exception as e:
-            print(f"[CalamariFraktur] Unexpected error during in-process inference: {e}; "
-                  "falling back to subprocess.", flush=True)
-            used_subprocess = True
-            results, confidences = _run_calamari_subprocess(numpy_images, calamari_checkpoints_dir)
-
-        if used_subprocess:
-            print(f"[CalamariFraktur] Subprocess returned {len(results)} result(s).", flush=True)
+            print(f"[CalamariFraktur] Pre-loaded predictor returned {len(results)} result(s).",
+                  flush=True)
         else:
-            print(f"[CalamariFraktur] In-process returned {len(results)} result(s).", flush=True)
+            try:
+                from glob import glob
+                from calamari_ocr.ocr.predict.predictor import Predictor, PredictorParams
+                from tfaip.util.tfaipargparse import post_init
+
+                checkpoints = glob(os.path.join(checkpoints_dir, "*.ckpt.json"))
+                if not checkpoints:
+                    raise ImportError(f"No .ckpt.json checkpoints found in {checkpoints_dir}")
+
+                params = PredictorParams()
+                params.silent = True
+                post_init(params)
+                fresh_predictor = Predictor.from_checkpoint(params=params, checkpoint=checkpoints)
+
+                for img_np in numpy_images:
+                    try:
+                        result = list(fresh_predictor.predict_raw([img_np]))
+                        results.append(result[0].outputs.sentence)
+                        confidences.append(
+                            float(getattr(result[0].outputs, "avg_char_probability", 0.0))
+                        )
+                    except Exception as e:
+                        print(f"[CalamariFraktur] In-process inference error: {e}", flush=True)
+                        results.append("")
+                        confidences.append(0.0)
+
+            except ImportError as e:
+                print(f"[CalamariFraktur] calamari_ocr not available in-process ({e}); "
+                      "falling back to subprocess.", flush=True)
+                used_subprocess = True
+                results, confidences = _run_calamari_subprocess(numpy_images, checkpoints_dir)
+
+            except Exception as e:
+                print(f"[CalamariFraktur] Unexpected error during in-process inference: {e}; "
+                      "falling back to subprocess.", flush=True)
+                used_subprocess = True
+                results, confidences = _run_calamari_subprocess(numpy_images, checkpoints_dir)
+
+            if used_subprocess:
+                print(f"[CalamariFraktur] Subprocess returned {len(results)} result(s).", flush=True)
+            else:
+                print(f"[CalamariFraktur] In-process returned {len(results)} result(s).", flush=True)
 
         # Pad to match input length if needed
         while len(results) < len(numpy_images):
@@ -513,3 +548,330 @@ class MergeTranscriptions:
               f"{len(handwritten_indices)} TrOCR lines into {total} total.", flush=True)
 
         return (merged_text, merged_lines_json)
+
+
+# ── Module-level cache for LoadCalamariFrakturModel ───────────────────────────
+
+_CALAMARI_MODEL_CACHE = {}   # key: "{checkpoints_dir}:{use_voting_ensemble}" → predictor or path str
+
+
+# ── Node 5: DownloadCalamariFrakturModel ──────────────────────────────────────
+
+class DownloadCalamariFrakturModel:
+    """
+    Downloads the chreul/19th-century-fraktur-OCR 5-model voting ensemble
+    from GitHub and saves it to ComfyUI's models/calamari/ directory.
+
+    Source: https://github.com/chreul/19th-century-fraktur-OCR
+    The /models/ subfolder contains 5 .ckpt files for voting ensemble.
+
+    Also optionally downloads the GT4HistOCR model from QURATOR:
+    https://qurator-data.de/calamari-models/GT4HistOCR/2019-12-11T11_10+0100/model.tar.xz
+    """
+
+    CATEGORY     = "HTR/German Documents"
+    FUNCTION     = "download"
+    OUTPUT_NODE  = True
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("checkpoints_dir", "download_log")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": (["fraktur19_chreul", "gt4histocr_qurator"],),
+                "output_base_dir": ("STRING", {
+                    "default": "/mnt/tjkdata/comfyui2/ComfyUI/models/calamari",
+                }),
+                "force_redownload": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    # ── helpers ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _reporthook(block_num, block_size, total_size):
+        """Print download progress every ~10%."""
+        if total_size <= 0:
+            return
+        downloaded = block_num * block_size
+        pct = min(100, int(downloaded * 100 / total_size))
+        # Only print at 10% intervals
+        prev_pct = min(100, int((block_num - 1) * block_size * 100 / total_size))
+        if pct // 10 > prev_pct // 10 or pct == 100:
+            mb = downloaded / (1024 * 1024)
+            total_mb = total_size / (1024 * 1024)
+            print(f"  [{pct:3d}%] {mb:.1f} / {total_mb:.1f} MB", flush=True)
+
+    @staticmethod
+    def _download_fraktur19(output_base_dir, force_redownload):
+        """Download chreul/19th-century-fraktur-OCR from GitHub."""
+        import urllib.request
+        import json as _json
+
+        target_dir   = os.path.join(output_base_dir, "fraktur19")
+        models_dir   = os.path.join(target_dir, "models")
+        log_lines    = []
+
+        # Check if already downloaded
+        if not force_redownload and os.path.isdir(models_dir):
+            existing = [f for f in os.listdir(models_dir) if f.endswith(".ckpt.json")]
+            if existing:
+                msg = (f"Already downloaded: {len(existing)} checkpoint(s) in {models_dir}")
+                print(f"[DownloadCalamariFrakturModel] {msg}", flush=True)
+                return models_dir, msg
+
+        os.makedirs(models_dir, exist_ok=True)
+        log_lines.append(f"Target: {models_dir}")
+
+        # ── Try GitHub API first ───────────────────────────────────────────────
+        api_url = "https://api.github.com/repos/chreul/19th-century-fraktur-OCR/contents/models"
+        file_entries = []
+        try:
+            req = urllib.request.Request(
+                api_url,
+                headers={"Accept": "application/vnd.github.v3+json",
+                         "User-Agent": "ComfyUI-tjk_suetterlin"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                file_entries = _json.loads(resp.read().decode("utf-8"))
+            log_lines.append(f"GitHub API: found {len(file_entries)} entries in /models/")
+            print(f"[DownloadCalamariFrakturModel] GitHub API: {len(file_entries)} entries",
+                  flush=True)
+        except Exception as api_err:
+            log_lines.append(f"GitHub API failed ({api_err}); using raw.githubusercontent.com fallback")
+            print(f"[DownloadCalamariFrakturModel] GitHub API failed: {api_err}", flush=True)
+            file_entries = []
+
+        # ── Download each file from API listing ───────────────────────────────
+        downloaded_count = 0
+        if file_entries:
+            for entry in file_entries:
+                if not isinstance(entry, dict):
+                    continue
+                name     = entry.get("name", "")
+                dl_url   = entry.get("download_url", "")
+                if not name or not dl_url:
+                    continue
+                dest = os.path.join(models_dir, name)
+                if os.path.exists(dest) and not force_redownload:
+                    log_lines.append(f"  skip (exists): {name}")
+                    continue
+                print(f"[DownloadCalamariFrakturModel] Downloading {name} …", flush=True)
+                try:
+                    urllib.request.urlretrieve(dl_url, dest,
+                                               reporthook=DownloadCalamariFrakturModel._reporthook)
+                    log_lines.append(f"  OK: {name}")
+                    downloaded_count += 1
+                except Exception as dl_err:
+                    log_lines.append(f"  FAIL: {name} — {dl_err}")
+                    print(f"[DownloadCalamariFrakturModel] FAIL {name}: {dl_err}", flush=True)
+        else:
+            # ── Fallback: raw.githubusercontent.com direct URLs ────────────────
+            # Re-query the API to get the actual filenames; if that also fails,
+            # use a hardcoded list of known Calamari checkpoint extensions.
+            raw_base = ("https://raw.githubusercontent.com/"
+                        "chreul/19th-century-fraktur-OCR/master/models/")
+            # Try to list via the tree API (no rate-limit header needed)
+            tree_url = ("https://api.github.com/repos/chreul/19th-century-fraktur-OCR/"
+                        "git/trees/master?recursive=1")
+            fallback_names = []
+            try:
+                req2 = urllib.request.Request(
+                    tree_url,
+                    headers={"Accept": "application/vnd.github.v3+json",
+                             "User-Agent": "ComfyUI-tjk_suetterlin"},
+                )
+                with urllib.request.urlopen(req2, timeout=30) as resp2:
+                    tree_data = _json.loads(resp2.read().decode("utf-8"))
+                for item in tree_data.get("tree", []):
+                    path = item.get("path", "")
+                    if path.startswith("models/") and item.get("type") == "blob":
+                        fallback_names.append(path[len("models/"):])
+                log_lines.append(f"Tree API fallback: {len(fallback_names)} files")
+            except Exception as tree_err:
+                log_lines.append(f"Tree API also failed ({tree_err}); no files to download")
+                print(f"[DownloadCalamariFrakturModel] Tree API failed: {tree_err}", flush=True)
+
+            for name in fallback_names:
+                if not name:
+                    continue
+                dest = os.path.join(models_dir, name)
+                if os.path.exists(dest) and not force_redownload:
+                    log_lines.append(f"  skip (exists): {name}")
+                    continue
+                dl_url = raw_base + name
+                print(f"[DownloadCalamariFrakturModel] Fallback download {name} …", flush=True)
+                try:
+                    urllib.request.urlretrieve(dl_url, dest,
+                                               reporthook=DownloadCalamariFrakturModel._reporthook)
+                    log_lines.append(f"  OK: {name}")
+                    downloaded_count += 1
+                except Exception as dl_err:
+                    log_lines.append(f"  FAIL: {name} — {dl_err}")
+                    print(f"[DownloadCalamariFrakturModel] FAIL {name}: {dl_err}", flush=True)
+
+        # ── Also download README.md from repo root ────────────────────────────
+        readme_dest = os.path.join(target_dir, "README.md")
+        if not os.path.exists(readme_dest) or force_redownload:
+            readme_url = ("https://raw.githubusercontent.com/"
+                          "chreul/19th-century-fraktur-OCR/master/README.md")
+            try:
+                urllib.request.urlretrieve(readme_url, readme_dest)
+                log_lines.append("README.md downloaded")
+            except Exception:
+                pass  # non-fatal
+
+        # ── Summary ───────────────────────────────────────────────────────────
+        ckpt_files = [f for f in os.listdir(models_dir) if f.endswith(".ckpt.json")]
+        summary = (f"Downloaded {downloaded_count} new file(s). "
+                   f"{len(ckpt_files)} .ckpt.json checkpoint(s) in {models_dir}")
+        log_lines.append(summary)
+        print(f"[DownloadCalamariFrakturModel] {summary}", flush=True)
+        return models_dir, "\n".join(log_lines)
+
+    @staticmethod
+    def _download_gt4histocr(output_base_dir, force_redownload):
+        """Download GT4HistOCR model from QURATOR as tar.xz."""
+        import urllib.request
+        import tarfile as _tarfile
+
+        target_dir = os.path.join(output_base_dir, "gt4histocr")
+        os.makedirs(target_dir, exist_ok=True)
+        log_lines  = [f"Target: {target_dir}"]
+
+        url      = ("https://qurator-data.de/calamari-models/GT4HistOCR/"
+                    "2019-12-11T11_10+0100/model.tar.xz")
+        archive  = os.path.join(target_dir, "model.tar.xz")
+
+        # Check if already extracted
+        if not force_redownload:
+            existing_ckpts = []
+            for root, _dirs, files in os.walk(target_dir):
+                existing_ckpts.extend(f for f in files if f.endswith(".ckpt.json"))
+            if existing_ckpts:
+                msg = (f"Already downloaded: {len(existing_ckpts)} checkpoint(s) in {target_dir}")
+                print(f"[DownloadCalamariFrakturModel] {msg}", flush=True)
+                return target_dir, msg
+
+        # Download archive
+        print(f"[DownloadCalamariFrakturModel] Downloading GT4HistOCR from {url} …", flush=True)
+        log_lines.append(f"URL: {url}")
+        try:
+            urllib.request.urlretrieve(url, archive,
+                                       reporthook=DownloadCalamariFrakturModel._reporthook)
+            log_lines.append(f"Archive downloaded: {archive}")
+        except Exception as dl_err:
+            msg = f"Download failed: {dl_err}"
+            log_lines.append(msg)
+            print(f"[DownloadCalamariFrakturModel] {msg}", flush=True)
+            return target_dir, "\n".join(log_lines)
+
+        # Extract
+        print(f"[DownloadCalamariFrakturModel] Extracting {archive} …", flush=True)
+        try:
+            with _tarfile.open(archive, "r:xz") as tf:
+                tf.extractall(target_dir)
+            log_lines.append("Extraction complete")
+            os.remove(archive)
+            log_lines.append("Archive removed after extraction")
+        except Exception as ex_err:
+            log_lines.append(f"Extraction failed: {ex_err}")
+            print(f"[DownloadCalamariFrakturModel] Extraction failed: {ex_err}", flush=True)
+
+        # Count checkpoints
+        ckpt_files = []
+        for root, _dirs, files in os.walk(target_dir):
+            ckpt_files.extend(f for f in files if f.endswith(".ckpt.json"))
+        summary = (f"{len(ckpt_files)} .ckpt.json checkpoint(s) found in {target_dir}")
+        log_lines.append(summary)
+        print(f"[DownloadCalamariFrakturModel] {summary}", flush=True)
+        return target_dir, "\n".join(log_lines)
+
+    # ── main entry point ───────────────────────────────────────────────────────
+
+    def download(self, model: str, output_base_dir: str, force_redownload: bool):
+        if model == "fraktur19_chreul":
+            checkpoints_dir, log = self._download_fraktur19(output_base_dir, force_redownload)
+        elif model == "gt4histocr_qurator":
+            checkpoints_dir, log = self._download_gt4histocr(output_base_dir, force_redownload)
+        else:
+            checkpoints_dir = output_base_dir
+            log = f"Unknown model: {model}"
+        return (checkpoints_dir, log)
+
+
+# ── Node 6: LoadCalamariFrakturModel ──────────────────────────────────────────
+
+class LoadCalamariFrakturModel:
+    """
+    Loads the Calamari Fraktur19 voting ensemble into memory and caches it.
+    Connect the output CALAMARI_MODEL to CalamariFrakturNode.
+
+    If calamari-ocr is not installed, returns the checkpoints_dir path string
+    so CalamariFrakturNode can fall back to subprocess mode.
+    """
+
+    CATEGORY     = "HTR/German Documents"
+    FUNCTION     = "load_model"
+    RETURN_TYPES = ("CALAMARI_MODEL",)
+    RETURN_NAMES = ("calamari_model",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "checkpoints_dir": ("STRING", {
+                    "default": "/mnt/tjkdata/comfyui2/ComfyUI/models/calamari/fraktur19/models",
+                }),
+                "use_voting_ensemble": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    def load_model(self, checkpoints_dir: str, use_voting_ensemble: bool):
+        global _CALAMARI_MODEL_CACHE
+
+        cache_key = f"{checkpoints_dir}:{use_voting_ensemble}"
+        if cache_key in _CALAMARI_MODEL_CACHE:
+            print(f"[LoadCalamariFrakturModel] Using cached model from {checkpoints_dir}",
+                  flush=True)
+            return (_CALAMARI_MODEL_CACHE[cache_key],)
+
+        try:
+            from glob import glob
+            from calamari_ocr.ocr.predict.predictor import Predictor, PredictorParams
+            from tfaip.util.tfaipargparse import post_init
+
+            all_ckpts = glob(os.path.join(checkpoints_dir, "*.ckpt.json"))
+            if not all_ckpts:
+                raise FileNotFoundError(
+                    f"No .ckpt.json files found in {checkpoints_dir}"
+                )
+
+            if use_voting_ensemble:
+                checkpoints = all_ckpts
+            else:
+                checkpoints = all_ckpts[:1]
+
+            print(f"[LoadCalamariFrakturModel] Loading {len(checkpoints)} checkpoint(s) "
+                  f"from {checkpoints_dir}", flush=True)
+
+            params = PredictorParams()
+            params.silent = True
+            post_init(params)
+            predictor = Predictor.from_checkpoint(params=params, checkpoint=checkpoints)
+
+            _CALAMARI_MODEL_CACHE[cache_key] = predictor
+            print(f"[LoadCalamariFrakturModel] Model loaded and cached OK", flush=True)
+            return (predictor,)
+
+        except ImportError as e:
+            print(f"[LoadCalamariFrakturModel] calamari-ocr not installed: {e}", flush=True)
+            print(f"[LoadCalamariFrakturModel] Returning checkpoints_dir for subprocess fallback",
+                  flush=True)
+            _CALAMARI_MODEL_CACHE[cache_key] = checkpoints_dir
+            return (checkpoints_dir,)
+
+        except Exception as e:
+            print(f"[LoadCalamariFrakturModel] Error loading model: {e}", flush=True)
+            return (checkpoints_dir,)
