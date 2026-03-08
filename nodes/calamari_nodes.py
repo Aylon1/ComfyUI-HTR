@@ -29,7 +29,7 @@ _NODE_DIR = os.path.dirname(os.path.abspath(__file__))   # nodes/
 _PKG_DIR  = os.path.dirname(_NODE_DIR)                    # tjk_suetterlin/
 
 WORKER_SCRIPT        = os.path.join(_PKG_DIR, "utils", "calamari_worker.py")
-CALAMARI_ENV_PYTHON  = os.path.join(_PKG_DIR, "calamari_env", "bin", "python")
+CALAMARI_ENV_PYTHON  = os.path.join(_PKG_DIR, "kraken_env", "bin", "python")
 
 # ── Model registry constants ──────────────────────────────────────────────────
 
@@ -97,8 +97,12 @@ def _run_calamari_subprocess(numpy_images, checkpoints_dir):
     """
     Encode images as base64 PNG, call calamari_worker.py via subprocess,
     return (results_list, confidences_list).
+
+    On worker error, returns a list of error-message strings (one per image)
+    so the transcription output is never silently empty.
     """
     python_exe = CALAMARI_ENV_PYTHON if os.path.exists(CALAMARI_ENV_PYTHON) else sys.executable
+    print(f"[CalamariFraktur] subprocess python: {python_exe}", flush=True)
 
     images_b64 = []
     for img_np in numpy_images:
@@ -128,36 +132,46 @@ def _run_calamari_subprocess(numpy_images, checkpoints_dir):
             env=clean_env,
         )
     except subprocess.TimeoutExpired:
-        print("[CalamariFraktur] Subprocess timed out after 300 s.", flush=True)
-        return ([""] * len(numpy_images), [0.0] * len(numpy_images))
+        msg = "[Calamari error: subprocess timed out after 300 s]"
+        print(f"[CalamariFraktur] {msg}", flush=True)
+        return ([msg] * len(numpy_images), [0.0] * len(numpy_images))
     except Exception as e:
-        print(f"[CalamariFraktur] Subprocess launch failed: {e}", flush=True)
-        return ([""] * len(numpy_images), [0.0] * len(numpy_images))
+        msg = f"[Calamari error: subprocess launch failed: {e}]"
+        print(f"[CalamariFraktur] {msg}", flush=True)
+        return ([msg] * len(numpy_images), [0.0] * len(numpy_images))
 
     if proc.stderr:
         for line in proc.stderr.strip().splitlines():
             print(f"  [calamari_worker] {line}", flush=True)
 
     if proc.returncode != 0:
-        print(f"[CalamariFraktur] Worker exited with code {proc.returncode}.", flush=True)
-        return ([""] * len(numpy_images), [0.0] * len(numpy_images))
+        msg = f"[Calamari error: worker exited with code {proc.returncode}]"
+        print(f"[CalamariFraktur] {msg}", flush=True)
+        return ([msg] * len(numpy_images), [0.0] * len(numpy_images))
 
     raw = proc.stdout.strip()
     if not raw:
-        print("[CalamariFraktur] Worker produced no output.", flush=True)
-        return ([""] * len(numpy_images), [0.0] * len(numpy_images))
+        msg = "[Calamari error: worker produced no output]"
+        print(f"[CalamariFraktur] {msg}", flush=True)
+        return ([msg] * len(numpy_images), [0.0] * len(numpy_images))
 
     try:
         output = json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"[CalamariFraktur] Could not parse worker JSON: {e}", flush=True)
-        return ([""] * len(numpy_images), [0.0] * len(numpy_images))
+        msg = f"[Calamari error: could not parse worker JSON: {e}]"
+        print(f"[CalamariFraktur] {msg}", flush=True)
+        return ([msg] * len(numpy_images), [0.0] * len(numpy_images))
 
     if "error" in output:
-        print(f"[CalamariFraktur] Worker error: {output['error']}", flush=True)
-        return ([""] * len(numpy_images), [0.0] * len(numpy_images))
+        worker_err = output["error"]
+        print(f"[CalamariFraktur] Worker error: {worker_err}", flush=True)
+        msg = f"[Calamari error: {worker_err}]"
+        return ([msg] * len(numpy_images), [0.0] * len(numpy_images))
 
-    return (output.get("results", []), output.get("confidences", []))
+    results     = output.get("results", [])
+    confidences = output.get("confidences", [])
+    print(f"[CalamariFraktur] First 3 results: {results[:3]}", flush=True)
+    return (results, confidences)
 
 
 # ── Download helper (module-level) ────────────────────────────────────────────
@@ -358,7 +372,10 @@ class CalamariFrakturNode:
                 results, confidences = _run_calamari_subprocess(numpy_images, checkpoints_dir)
 
             if used_subprocess:
-                print(f"[CalamariFraktur] Subprocess returned {len(results)} result(s).", flush=True)
+                non_empty = sum(1 for r in results if r and not r.startswith("[Calamari error:"))
+                print(f"[CalamariFraktur] Subprocess returned {len(results)} result(s) "
+                      f"({non_empty} non-empty).", flush=True)
+                print(f"[CalamariFraktur] First 3 results: {results[:3]}", flush=True)
             else:
                 print(f"[CalamariFraktur] In-process returned {len(results)} result(s).", flush=True)
 
