@@ -382,7 +382,20 @@ class LLMHTRCorrection:
         # --- Align LLM output lines with input lines ---
         # Filter blank lines: LLMs sometimes use blank lines as paragraph
         # separators (mirroring the prompt format), which shifts alignment.
-        llm_lines = [l for l in raw_response.strip().splitlines() if l.strip()]
+        import re as _re
+        raw_lines = [l for l in raw_response.strip().splitlines() if l.strip()]
+
+        # Strip preamble: some LLMs prepend a header line ending with ':'
+        # e.g. "The corrected transcriptions are:" — drop all leading lines
+        # that end with ':' and contain no digit-dot prefix.
+        _num_prefix = _re.compile(r'^\s*\d+[\.\)]\s*')
+        while raw_lines and raw_lines[0].rstrip().endswith(':') and not _num_prefix.match(raw_lines[0]):
+            print(f"[LLMHTRCorrection] Stripping preamble line: {raw_lines[0]!r}")
+            raw_lines = raw_lines[1:]
+
+        # Strip leading numbering "1. ", "2) ", etc. from each line
+        llm_lines = [_num_prefix.sub('', l).strip() for l in raw_lines]
+
         print(f"[LLMHTRCorrection] LLM returned {len(llm_lines)} non-blank lines "
               f"for {len(hypotheses_data)} input lines.")
         corrected_lines = []
