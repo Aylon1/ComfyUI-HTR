@@ -101,4 +101,11 @@ try:
 except Exception as e:
     logger.warning(f"Could not import llm_correction_nodes: {e}")
 
+try:
+    from .result_viewer_nodes import LineTranscriptionViewer
+    NODE_CLASS_MAPPINGS["LineTranscriptionViewer"] = LineTranscriptionViewer
+    NODE_DISPLAY_NAME_MAPPINGS["LineTranscriptionViewer"] = "Line Transcription Viewer"
+except Exception as e:
+    logger.warning(f"Could not import result_viewer_nodes: {e}")
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

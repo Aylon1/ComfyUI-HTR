@@ -7,12 +7,17 @@ that TrOCR was trained on: clean black text on white background.
 
 All operations use only PIL (Pillow) and numpy — no opencv or scikit-image
 required beyond what is already in requirements.txt.
+
+Improvements:
+- per_line_adaptive BOOLEAN: compute Otsu threshold independently per line
+  (better for uneven lighting across a document page)
+- Proper Otsu's algorithm (replaces the old mean-based approximation)
 """
 
 import numpy as np
 import torch
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -23,38 +28,37 @@ _TROCR_LINE_HEIGHT = 64
 
 # ── Binarization helpers ──────────────────────────────────────────────────────
 
-def _otsu_threshold(gray_array: np.ndarray) -> int:
+def _otsu_threshold(img_np: np.ndarray) -> int:
     """
-    Compute Otsu's optimal threshold from a uint8 grayscale array.
+    Compute Otsu's optimal threshold for a grayscale uint8 image.
+
+    Uses the between-class variance maximisation formulation.
     Returns an integer threshold in [1, 254].
     Falls back to 128 if the image is uniform (all same value).
     """
-    hist, _ = np.histogram(gray_array.flatten(), bins=256, range=(0, 256))
+    hist, _ = np.histogram(img_np.flatten(), bins=256, range=(0, 256))
     hist = hist.astype(float)
-    total = float(gray_array.size)
+    total = img_np.size
     if total == 0:
         return 128
 
-    sum_total = float(np.dot(np.arange(256), hist))
-    sum_bg = 0.0
-    weight_bg = 0.0
-    max_var = 0.0
-    threshold = 128  # safe default
+    sum_total = np.dot(np.arange(256), hist)
+    sum_bg, weight_bg, weight_fg = 0.0, 0.0, 0.0
+    max_var, threshold = 0.0, 128  # safe default
 
     for t in range(256):
         weight_bg += hist[t]
-        if weight_bg == 0.0:
+        if weight_bg == 0:
             continue
         weight_fg = total - weight_bg
-        if weight_fg == 0.0:
+        if weight_fg == 0:
             break
         sum_bg += t * hist[t]
         mean_bg = sum_bg / weight_bg
         mean_fg = (sum_total - sum_bg) / weight_fg
-        var_between = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
-        if var_between > max_var:
-            max_var = var_between
-            threshold = t
+        var = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+        if var > max_var:
+            max_var, threshold = var, t
 
     # Guard against degenerate (uniform) images
     if threshold <= 0 or threshold >= 255:
@@ -62,9 +66,17 @@ def _otsu_threshold(gray_array: np.ndarray) -> int:
     return threshold
 
 
-def _apply_otsu(gray_array: np.ndarray) -> np.ndarray:
-    """Apply Otsu threshold. Returns uint8 array: 0=black text, 255=white bg."""
-    t = _otsu_threshold(gray_array)
+def _apply_otsu(gray_array: np.ndarray,
+                precomputed_threshold: Optional[int] = None) -> np.ndarray:
+    """
+    Apply Otsu threshold.
+
+    If precomputed_threshold is given, use it directly (batch mode).
+    Otherwise compute fresh from this image (per-line adaptive mode).
+
+    Returns uint8 array: 0=black text, 255=white bg.
+    """
+    t = precomputed_threshold if precomputed_threshold is not None else _otsu_threshold(gray_array)
     return np.where(gray_array < t, 0, 255).astype(np.uint8)
 
 
@@ -240,6 +252,11 @@ class PreprocessLineImages:
 
     Connect between KrakenLineSegmentation and BatchTrOCRInference.
     All operations use only PIL and numpy — no extra dependencies required.
+
+    per_line_adaptive=True (default): compute Otsu threshold independently
+    for each line image, which handles uneven lighting across the page.
+    per_line_adaptive=False: compute threshold once on the first line and
+    reuse for all lines (consistent batch processing).
     """
 
     @classmethod
@@ -257,6 +274,20 @@ class PreprocessLineImages:
                             "otsu: global optimal threshold (fast, good for clean docs). "
                             "adaptive: local mean threshold (better for uneven lighting). "
                             "sauvola: local mean+std threshold (best for degraded docs, slowest)."
+                        ),
+                    },
+                ),
+                # ── Per-line adaptive threshold ───────────────────────────────
+                "per_line_adaptive": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Compute binarization threshold independently per line "
+                            "(better for uneven lighting across the page). "
+                            "Only affects the 'otsu' method; adaptive/sauvola are "
+                            "inherently local. When False, threshold is computed once "
+                            "from the first line and reused for all lines."
                         ),
                     },
                 ),
@@ -321,6 +352,7 @@ class PreprocessLineImages:
         self,
         images: torch.Tensor,
         binarization_method: str,
+        per_line_adaptive: bool,
         invert_mode: str,
         contrast_enhance: float,
         sharpen: bool,
@@ -333,6 +365,7 @@ class PreprocessLineImages:
         ----------
         images               : [B, H, W, C] float32 [0,1] — batch of line crops
         binarization_method  : "none" | "otsu" | "adaptive" | "sauvola"
+        per_line_adaptive    : compute Otsu threshold per line (True) or once (False)
         invert_mode          : "auto" | "force_normal" | "force_invert"
         contrast_enhance     : float multiplier for PIL Contrast enhancer
         sharpen              : apply PIL SHARPEN filter
@@ -345,6 +378,21 @@ class PreprocessLineImages:
         batch_size = images.shape[0]
         processed: List[Image.Image] = []
 
+        # For per_line_adaptive=False with otsu: compute threshold once from
+        # the first line image and reuse it for all subsequent lines.
+        global_otsu_threshold: Optional[int] = None
+
+        if binarization_method == "otsu" and not per_line_adaptive and batch_size > 0:
+            # Compute threshold from the first line
+            first_pil = _tensor_slice_to_pil(images[0]).convert("RGB")
+            if abs(contrast_enhance - 1.0) > 1e-6:
+                first_pil = ImageEnhance.Contrast(first_pil).enhance(contrast_enhance)
+            if sharpen:
+                first_pil = first_pil.filter(ImageFilter.SHARPEN)
+            first_gray = np.array(first_pil.convert("L"))
+            global_otsu_threshold = _otsu_threshold(first_gray)
+            print(f"[PreprocessLineImages] Global Otsu threshold (from line 0): {global_otsu_threshold}")
+
         for i in range(batch_size):
             pil_img = _tensor_slice_to_pil(images[i]).convert("RGB")
             pil_img = self._process_single(
@@ -354,6 +402,7 @@ class PreprocessLineImages:
                 contrast_enhance=contrast_enhance,
                 sharpen=sharpen,
                 deskew=deskew,
+                precomputed_otsu=global_otsu_threshold,
             )
             processed.append(pil_img)
 
@@ -370,6 +419,7 @@ class PreprocessLineImages:
         contrast_enhance: float,
         sharpen: bool,
         deskew: bool,
+        precomputed_otsu: Optional[int] = None,
     ) -> Image.Image:
         """
         Apply the full preprocessing pipeline to a single PIL RGB image.
@@ -382,6 +432,9 @@ class PreprocessLineImages:
           5. Invert correction (auto / force_normal / force_invert)
           6. Deskew (if deskew)
           7. Convert back to RGB
+
+        precomputed_otsu: if provided, use this threshold for otsu instead of
+                          computing it fresh (batch/global mode).
         """
         # ── Step 1: Contrast enhancement ──────────────────────────────────────
         if abs(contrast_enhance - 1.0) > 1e-6:
@@ -397,10 +450,13 @@ class PreprocessLineImages:
 
         # ── Step 4: Binarization ──────────────────────────────────────────────
         if binarization_method == "otsu":
-            binary_arr = _apply_otsu(gray_arr)
+            # precomputed_otsu=None → compute fresh per line (per_line_adaptive=True)
+            # precomputed_otsu=int  → reuse global threshold (per_line_adaptive=False)
+            binary_arr = _apply_otsu(gray_arr, precomputed_threshold=precomputed_otsu)
             result_pil = Image.fromarray(binary_arr, mode="L")
 
         elif binarization_method == "adaptive":
+            # adaptive/sauvola are inherently local; per_line_adaptive has no effect
             binary_arr = _apply_adaptive(gray_arr)
             result_pil = Image.fromarray(binary_arr, mode="L")
 
