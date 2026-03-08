@@ -177,9 +177,18 @@ class TrOCRInference:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": ("TROCR_MODEL",),
-                "image": ("IMAGE",),
-                "max_length": ("INT", {"default": 256, "min": 1, "max": 1024}),
+                "model":                ("TROCR_MODEL",),
+                "image":                ("IMAGE",),
+                "max_new_tokens":       ("INT",     {"default": 128,  "min": 32,  "max": 512,
+                                                     "tooltip": "Maximum number of new tokens to generate (excludes BOS token)."}),
+                "num_beams":            ("INT",     {"default": 10,   "min": 1,   "max": 20,
+                                                     "tooltip": "Number of beams for beam search. 1 = greedy decoding (fastest). Higher values improve quality but are slower."}),
+                "early_stopping":       ("BOOLEAN", {"default": True,
+                                                     "tooltip": "Stop beam search when all beams reach EOS. Only applies when num_beams > 1."}),
+                "no_repeat_ngram_size": ("INT",     {"default": 3,    "min": 0,   "max": 5,
+                                                     "tooltip": "Prevent repetition of n-grams of this size. 0 = disabled."}),
+                "length_penalty":       ("FLOAT",   {"default": 1.0,  "min": 0.5, "max": 2.0, "step": 0.1,
+                                                     "tooltip": "Exponential penalty applied to sequence length. >1 favours longer sequences, <1 favours shorter. Only applies when num_beams > 1."}),
             }
         }
     
@@ -188,7 +197,9 @@ class TrOCRInference:
     FUNCTION = "transcribe"
     CATEGORY = "Sütterlin HTR/Inference"
 
-    def transcribe(self, model: Dict[str, Any], image: torch.Tensor, max_length: int):
+    def transcribe(self, model: Dict[str, Any], image: torch.Tensor,
+                   max_new_tokens: int, num_beams: int, early_stopping: bool,
+                   no_repeat_ngram_size: int, length_penalty: float):
         trocr_model = model["model"]
         processor = model["processor"]
         
@@ -200,24 +211,26 @@ class TrOCRInference:
         model_dtype = next(trocr_model.parameters()).dtype
         pixel_values = pixel_values.to(model_dtype)
         
-        # Generation
+        # Generation with beam search parameters
         with torch.no_grad():
             outputs = trocr_model.generate(
                 pixel_values,
-                max_length=max_length,
+                max_new_tokens=max_new_tokens,
+                num_beams=num_beams,
+                early_stopping=early_stopping,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                length_penalty=length_penalty,
                 return_dict_in_generate=True,
-                output_scores=True
+                output_scores=True,
             )
             
         generated_ids = outputs.sequences
         generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
         
-        # Calculate confidence
-        confidence = 1.0 # default if no scores
+        # Calculate confidence (mean max-softmax over generated tokens)
+        confidence = 1.0  # default if no scores
         if outputs.scores:
             try:
-                # Approximation of sequence confidence based on token scores
-                # Calculate mean log probability
                 scores = []
                 for step_scores in outputs.scores:
                     probs = torch.nn.functional.softmax(step_scores, dim=-1)
@@ -238,10 +251,19 @@ class BatchTrOCRInference:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": ("TROCR_MODEL",),
-                "images": ("IMAGE",),
-                "max_length": ("INT", {"default": 256, "min": 1, "max": 1024}),
-                "separator": ("STRING", {"default": "\\n"}),
+                "model":                ("TROCR_MODEL",),
+                "images":               ("IMAGE",),
+                "max_new_tokens":       ("INT",     {"default": 128,  "min": 32,  "max": 512,
+                                                     "tooltip": "Maximum number of new tokens to generate per line (excludes BOS token)."}),
+                "num_beams":            ("INT",     {"default": 10,   "min": 1,   "max": 20,
+                                                     "tooltip": "Number of beams for beam search. 1 = greedy decoding (fastest). Higher values improve quality but are slower."}),
+                "early_stopping":       ("BOOLEAN", {"default": True,
+                                                     "tooltip": "Stop beam search when all beams reach EOS. Only applies when num_beams > 1."}),
+                "no_repeat_ngram_size": ("INT",     {"default": 3,    "min": 0,   "max": 5,
+                                                     "tooltip": "Prevent repetition of n-grams of this size. 0 = disabled."}),
+                "length_penalty":       ("FLOAT",   {"default": 1.0,  "min": 0.5, "max": 2.0, "step": 0.1,
+                                                     "tooltip": "Exponential penalty applied to sequence length. >1 favours longer sequences, <1 favours shorter. Only applies when num_beams > 1."}),
+                "separator":            ("STRING",  {"default": "\\n"}),
             }
         }
     
@@ -250,7 +272,9 @@ class BatchTrOCRInference:
     FUNCTION = "transcribe_batch"
     CATEGORY = "Sütterlin HTR/Inference"
 
-    def transcribe_batch(self, model: Dict[str, Any], images: torch.Tensor, max_length: int, separator: str):
+    def transcribe_batch(self, model: Dict[str, Any], images: torch.Tensor,
+                         max_new_tokens: int, num_beams: int, early_stopping: bool,
+                         no_repeat_ngram_size: int, length_penalty: float, separator: str):
         # Interpret literal '\n' as actual newline
         if separator == "\\n":
             separator = "\n"
@@ -268,7 +292,7 @@ class BatchTrOCRInference:
         
         # Simple loop approach to avoid dynamic padding issues with TrOCR
         for i in range(batch_size):
-            img_tensor = images[i:i+1] # Keep batch dim for tensor2pil just in case
+            img_tensor = images[i:i+1]  # Keep batch dim for tensor2pil
             pil_img = tensor2pil(img_tensor).convert("RGB")
             
             pixel_values = processor(pil_img, return_tensors="pt").pixel_values
@@ -277,20 +301,27 @@ class BatchTrOCRInference:
             with torch.no_grad():
                 outputs = trocr_model.generate(
                     pixel_values,
-                    max_length=max_length,
+                    max_new_tokens=max_new_tokens,
+                    num_beams=num_beams,
+                    early_stopping=early_stopping,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                    length_penalty=length_penalty,
                     return_dict_in_generate=True,
-                    output_scores=True
+                    output_scores=True,
                 )
                 
             generated_ids = outputs.sequences
             generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
             lines.append(generated_text)
             
-            # Confidence
+            # Confidence: mean max-softmax over generated tokens
             conf = 1.0
             if outputs.scores:
                 try:
-                    scores = [torch.max(torch.nn.functional.softmax(s, dim=-1), dim=-1).values.item() for s in outputs.scores]
+                    scores = [
+                        torch.max(torch.nn.functional.softmax(s, dim=-1), dim=-1).values.item()
+                        for s in outputs.scores
+                    ]
                     if scores:
                         conf = sum(scores) / len(scores)
                 except Exception:

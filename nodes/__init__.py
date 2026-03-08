@@ -67,6 +67,13 @@ except Exception as e:
     logger.warning(f"Could not import input_nodes: {e}")
 
 try:
+    from .preprocess_nodes import PreprocessLineImages
+    NODE_CLASS_MAPPINGS["PreprocessLineImages"] = PreprocessLineImages
+    NODE_DISPLAY_NAME_MAPPINGS["PreprocessLineImages"] = "Preprocess Line Images"
+except Exception as e:
+    logger.warning(f"Could not import preprocess_nodes: {e}")
+
+try:
     from .llm_nodes import LLMTextCorrector
     NODE_CLASS_MAPPINGS["LLMTextCorrector"] = LLMTextCorrector
     NODE_DISPLAY_NAME_MAPPINGS["LLMTextCorrector"] = "LLM Text Corrector"
@@ -79,5 +86,19 @@ try:
     NODE_DISPLAY_NAME_MAPPINGS["KrakenLineSegmentation"] = "Kraken Line Segmentation"
 except Exception as e:
     logger.warning(f"Could not import kraken_nodes: {e}")
+
+try:
+    from .tta_nodes import TTAEnsembleTrOCR
+    NODE_CLASS_MAPPINGS["TTAEnsembleTrOCR"] = TTAEnsembleTrOCR
+    NODE_DISPLAY_NAME_MAPPINGS["TTAEnsembleTrOCR"] = "TTA Ensemble TrOCR"
+except Exception as e:
+    logger.warning(f"Could not import tta_nodes: {e}")
+
+try:
+    from .llm_correction_nodes import LLMHTRCorrection
+    NODE_CLASS_MAPPINGS["LLMHTRCorrection"] = LLMHTRCorrection
+    NODE_DISPLAY_NAME_MAPPINGS["LLMHTRCorrection"] = "LLM HTR Correction"
+except Exception as e:
+    logger.warning(f"Could not import llm_correction_nodes: {e}")
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

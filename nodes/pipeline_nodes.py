@@ -152,10 +152,14 @@ class SuetterlinHTRComplete:
         # 4. TrOCR Inference
         batch_inferencer = BatchTrOCRInference()
         combined_text, text_lines, confidences = batch_inferencer.transcribe_batch(
-            model=trocr_model, 
-            images=cropped_tensor, 
-            max_length=256, 
-            separator="\n"
+            model=trocr_model,
+            images=cropped_tensor,
+            max_new_tokens=128,
+            num_beams=10,
+            early_stopping=True,
+            no_repeat_ngram_size=3,
+            length_penalty=1.0,
+            separator="\n",
         )
         
         metadata = {
