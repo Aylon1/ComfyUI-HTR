@@ -49,11 +49,12 @@ CALAMARI_MODELS_DIR = "/mnt/tjkdata/comfyui2/ComfyUI/models/calamari"
 
 CALAMARI_MODEL_REGISTRY = {
     "fraktur_gt4histocr": {
-        "display": "GT4HistOCR Fraktur (QURATOR, calamari 2.x) — Historical German Fraktur",
+        "display": "Fraktur 19th century (Calamari-OCR/calamari_models, calamari 2.x)",
         "local_subdir": "fraktur_gt4histocr/models",
-        # calamari 2.x compatible tar.gz from qurator-data.de
-        # Contains .ckpt.h5 Keras checkpoints
-        "download_url": "https://qurator-data.de/calamari-models/GT4HistOCR/2022-04-14T07_00+0200/model.tar.gz",
+        # calamari 2.x compatible model from official Calamari-OCR GitHub repo
+        # Contains .ckpt directories with Keras checkpoints
+        "github_repo": "Calamari-OCR/calamari_models",
+        "github_models_path": "fraktur_19th_century",
         "calamari_version": 2,
     },
     "fraktur19_chreul": {

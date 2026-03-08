@@ -109,8 +109,24 @@ def run_prediction(checkpoints_dir, images_b64_list):
             img_np    = np.array(pil_img)
 
             result = list(predictor.predict_raw([img_np]))
-            sentence   = result[0].outputs.sentence
-            confidence = float(getattr(result[0].outputs, "avg_char_probability", 0.0))
+            sample = result[0]
+            outputs = sample.outputs
+
+            # MultiPredictor returns outputs as a tuple: (list_of_per_model_outputs, voted_output)
+            # Each per-model output has .sentence; use the first (voted) result
+            if isinstance(outputs, tuple):
+                # outputs[0] is a list of per-model results; outputs[0][0] is the voted winner
+                per_model = outputs[0]
+                if per_model and hasattr(per_model[0], "sentence"):
+                    sentence = per_model[0].sentence
+                    confidence = float(getattr(per_model[0], "avg_char_probability", 0.0))
+                else:
+                    sentence = str(per_model[0]) if per_model else ""
+                    confidence = 0.0
+            else:
+                # Single Predictor: outputs has .sentence directly
+                sentence   = outputs.sentence
+                confidence = float(getattr(outputs, "avg_char_probability", 0.0))
 
             results.append(sentence)
             confidences.append(confidence)
