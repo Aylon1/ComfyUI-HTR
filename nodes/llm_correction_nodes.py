@@ -55,7 +55,7 @@ def _build_prompt(hypotheses_data: List[Dict], context_hint: str) -> str:
             block += "\n  Alternatives: " + " | ".join(unique_alts)
         lines_text.append(block)
 
-    all_lines = "\n\n".join(lines_text)
+    all_lines = "\n".join(lines_text)
 
     return (
         f"Document context: {context_hint}\n\n"
@@ -302,6 +302,10 @@ class LLMHTRCorrection:
         api_key: str = "",
     ):
         # --- Parse hypotheses JSON ---
+        print(f"[LLMHTRCorrection] Received all_hypotheses_json type={type(all_hypotheses_json).__name__} "
+              f"len={len(all_hypotheses_json) if all_hypotheses_json else 0} "
+              f"preview={repr(all_hypotheses_json[:80]) if all_hypotheses_json else 'None'}")
+
         if not all_hypotheses_json or all_hypotheses_json.strip() in ("", "[]"):
             print("[LLMHTRCorrection] Warning: empty all_hypotheses_json — returning empty string.")
             return ("",)
@@ -309,7 +313,10 @@ class LLMHTRCorrection:
         try:
             hypotheses_data = json.loads(all_hypotheses_json)
         except json.JSONDecodeError as e:
-            raise ValueError(f"[LLMHTRCorrection] Invalid JSON in all_hypotheses_json: {e}")
+            print(f"[LLMHTRCorrection] ERROR: Invalid JSON in all_hypotheses_json: {e}")
+            print(f"[LLMHTRCorrection] First 200 chars: {repr(all_hypotheses_json[:200])}")
+            # Fallback: return empty rather than crashing ComfyUI
+            return ("",)
 
         if not hypotheses_data:
             return ("",)
@@ -373,7 +380,11 @@ class LLMHTRCorrection:
             return (fallback,)
 
         # --- Align LLM output lines with input lines ---
-        llm_lines = raw_response.strip().splitlines()
+        # Filter blank lines: LLMs sometimes use blank lines as paragraph
+        # separators (mirroring the prompt format), which shifts alignment.
+        llm_lines = [l for l in raw_response.strip().splitlines() if l.strip()]
+        print(f"[LLMHTRCorrection] LLM returned {len(llm_lines)} non-blank lines "
+              f"for {len(hypotheses_data)} input lines.")
         corrected_lines = []
         for i, item in enumerate(hypotheses_data):
             if i < len(llm_lines):
