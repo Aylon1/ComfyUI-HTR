@@ -108,4 +108,40 @@ try:
 except Exception as e:
     logger.warning(f"Could not import result_viewer_nodes: {e}")
 
+try:
+    from .calamari_nodes import (
+        CalamariFrakturNode,
+        PrintedHandwrittenClassifier,
+        MixedScriptRouter,
+        MergeTranscriptions,
+    )
+    NODE_CLASS_MAPPINGS["CalamariFraktur"] = CalamariFrakturNode
+    NODE_CLASS_MAPPINGS["PrintedHandwrittenClassifier"] = PrintedHandwrittenClassifier
+    NODE_CLASS_MAPPINGS["MixedScriptRouter"] = MixedScriptRouter
+    NODE_CLASS_MAPPINGS["MergeTranscriptions"] = MergeTranscriptions
+    NODE_DISPLAY_NAME_MAPPINGS["CalamariFraktur"] = "Calamari Fraktur OCR"
+    NODE_DISPLAY_NAME_MAPPINGS["PrintedHandwrittenClassifier"] = "Printed/Handwritten Classifier"
+    NODE_DISPLAY_NAME_MAPPINGS["MixedScriptRouter"] = "Mixed Script Router"
+    NODE_DISPLAY_NAME_MAPPINGS["MergeTranscriptions"] = "Merge Transcriptions"
+except Exception as e:
+    logger.warning(f"Could not import calamari_nodes: {e}")
+
+try:
+    from .training_nodes import (
+        GTPreparationNode,
+        CalamariFinetuneNode,
+        TrOCRFinetuneNode,
+        DatasetDownloaderNode,
+    )
+    NODE_CLASS_MAPPINGS["GTPreparation"] = GTPreparationNode
+    NODE_CLASS_MAPPINGS["CalamariFinetuning"] = CalamariFinetuneNode
+    NODE_CLASS_MAPPINGS["TrOCRFinetuning"] = TrOCRFinetuneNode
+    NODE_CLASS_MAPPINGS["DatasetDownloader"] = DatasetDownloaderNode
+    NODE_DISPLAY_NAME_MAPPINGS["GTPreparation"] = "Ground Truth Preparation"
+    NODE_DISPLAY_NAME_MAPPINGS["CalamariFinetuning"] = "Calamari Fine-tuning"
+    NODE_DISPLAY_NAME_MAPPINGS["TrOCRFinetuning"] = "TrOCR Fine-tuning"
+    NODE_DISPLAY_NAME_MAPPINGS["DatasetDownloader"] = "Dataset Downloader"
+except Exception as e:
+    logger.warning(f"Could not import training_nodes: {e}")
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
