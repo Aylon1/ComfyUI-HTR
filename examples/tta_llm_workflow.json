@@ -1,0 +1,140 @@
+{
+  "_comment": "Full TTA + LLM correction pipeline: LoadImage → KrakenLineSegmentation → PreprocessLineImages → TTAEnsembleTrOCR → LLMHTRCorrection → TextOutput. The original image is also wired to LLMHTRCorrection for multimodal grounding. Node wiring: 1→2(image), 2→3(cropped_lines), 4→5(model), 3→5(preprocessed_images), 5→6(all_hypotheses_json), 1→6(image for multimodal), 6→7(corrected_text), 2→8(annotated_image preview).",
+  "1": {
+    "inputs": {
+      "image": "example_suetterlin.jpg",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Handwriting Image"
+    }
+  },
+  "2": {
+    "inputs": {
+      "image": [
+        "1",
+        0
+      ],
+      "device": "auto",
+      "model": "default",
+      "padding": 4,
+      "min_width": 20,
+      "min_height": 10
+    },
+    "class_type": "KrakenLineSegmentation",
+    "_meta": {
+      "title": "Kraken Line Segmentation (BLLA)",
+      "note": "Outputs: [0]=cropped_lines (IMAGE batch), [1]=bboxes (JSON), [2]=count (INT), [3]=annotated_image (IMAGE)"
+    }
+  },
+  "3": {
+    "inputs": {
+      "images": [
+        "2",
+        0
+      ],
+      "binarization_method": "otsu",
+      "invert_mode": "auto",
+      "contrast_enhance": 1.2,
+      "sharpen": false,
+      "deskew": false
+    },
+    "class_type": "PreprocessLineImages",
+    "_meta": {
+      "title": "Preprocess Line Images",
+      "note": "Normalises line crops to clean black-on-white for TrOCR. Receives cropped_lines from KrakenLineSegmentation output [0]."
+    }
+  },
+  "4": {
+    "inputs": {
+      "model_name": "trocr-kurrent",
+      "device": "auto",
+      "dtype": "auto",
+      "auto_download": true
+    },
+    "class_type": "LoadTrOCRModel",
+    "_meta": {
+      "title": "Load TrOCR Model (Kurrent/Sütterlin)"
+    }
+  },
+  "5": {
+    "inputs": {
+      "images": [
+        "3",
+        0
+      ],
+      "trocr_model": [
+        "4",
+        0
+      ],
+      "num_beams": 5,
+      "max_new_tokens": 128,
+      "no_repeat_ngram_size": 3,
+      "use_original": true,
+      "use_slight_blur": true,
+      "use_sharpen": true,
+      "use_contrast_up": true,
+      "use_contrast_down": true,
+      "use_rotate_cw": true,
+      "use_rotate_ccw": true,
+      "join_lines": true
+    },
+    "class_type": "TTAEnsembleTrOCR",
+    "_meta": {
+      "title": "TTA Ensemble TrOCR",
+      "note": "Outputs: [0]=transcription (STRING, newline-joined winners), [1]=all_hypotheses_json (STRING, full JSON for LLM correction). Receives preprocessed_images from PreprocessLineImages [0] and model from LoadTrOCRModel [0]."
+    }
+  },
+  "6": {
+    "inputs": {
+      "all_hypotheses_json": [
+        "5",
+        1
+      ],
+      "llm_provider": "ollama",
+      "model_name": "llama3.2-vision:11b",
+      "context_hint": "19th century German civil registry document (Geburtsurkunde/Heiratsurkunde/Sterbeurkunde). May contain German personal names, place names in Prussia/Pommern, standard civil registry phrases, abbreviations like geb. (geborene), i/Pom. (in Pommern), Str. (Straße).",
+      "temperature": 0.1,
+      "ollama_host": "http://localhost:11434",
+      "image": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "LLMHTRCorrection",
+    "_meta": {
+      "title": "LLM HTR Correction (Ollama)",
+      "note": "Post-corrects TTA transcription using a language model. Receives all_hypotheses_json from TTAEnsembleTrOCR output [1] and the original image from LoadImage output [0] for multimodal grounding. Output [0]=corrected_text (STRING)."
+    }
+  },
+  "7": {
+    "inputs": {
+      "text": [
+        "6",
+        0
+      ],
+      "save_to_file": false,
+      "output_path": "transcription_llm.txt",
+      "format": "txt"
+    },
+    "class_type": "TextOutput",
+    "_meta": {
+      "title": "Corrected Transcription Output",
+      "note": "Set save_to_file=true and output_path to a filename (e.g. transcription_llm.txt) to save results to disk. Receives corrected_text from LLMHTRCorrection output [0]."
+    }
+  },
+  "8": {
+    "inputs": {
+      "images": [
+        "2",
+        3
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "Annotated Lines Preview",
+      "note": "Shows detected line polygons overlaid on the original image. Uses KrakenLineSegmentation output [3]=annotated_image."
+    }
+  }
+}

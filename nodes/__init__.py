@@ -67,6 +67,13 @@ except Exception as e:
     logger.warning(f"Could not import input_nodes: {e}")
 
 try:
+    from .preprocess_nodes import PreprocessLineImages
+    NODE_CLASS_MAPPINGS["PreprocessLineImages"] = PreprocessLineImages
+    NODE_DISPLAY_NAME_MAPPINGS["PreprocessLineImages"] = "Preprocess Line Images"
+except Exception as e:
+    logger.warning(f"Could not import preprocess_nodes: {e}")
+
+try:
     from .llm_nodes import LLMTextCorrector
     NODE_CLASS_MAPPINGS["LLMTextCorrector"] = LLMTextCorrector
     NODE_DISPLAY_NAME_MAPPINGS["LLMTextCorrector"] = "LLM Text Corrector"
@@ -79,5 +86,65 @@ try:
     NODE_DISPLAY_NAME_MAPPINGS["KrakenLineSegmentation"] = "Kraken Line Segmentation"
 except Exception as e:
     logger.warning(f"Could not import kraken_nodes: {e}")
+
+try:
+    from .tta_nodes import TTAEnsembleTrOCR
+    NODE_CLASS_MAPPINGS["TTAEnsembleTrOCR"] = TTAEnsembleTrOCR
+    NODE_DISPLAY_NAME_MAPPINGS["TTAEnsembleTrOCR"] = "TTA Ensemble TrOCR"
+except Exception as e:
+    logger.warning(f"Could not import tta_nodes: {e}")
+
+try:
+    from .llm_correction_nodes import LLMHTRCorrection
+    NODE_CLASS_MAPPINGS["LLMHTRCorrection"] = LLMHTRCorrection
+    NODE_DISPLAY_NAME_MAPPINGS["LLMHTRCorrection"] = "LLM HTR Correction"
+except Exception as e:
+    logger.warning(f"Could not import llm_correction_nodes: {e}")
+
+try:
+    from .result_viewer_nodes import LineTranscriptionViewer
+    NODE_CLASS_MAPPINGS["LineTranscriptionViewer"] = LineTranscriptionViewer
+    NODE_DISPLAY_NAME_MAPPINGS["LineTranscriptionViewer"] = "Line Transcription Viewer"
+except Exception as e:
+    logger.warning(f"Could not import result_viewer_nodes: {e}")
+
+try:
+    from .calamari_nodes import (
+        CalamariFrakturNode,
+        PrintedHandwrittenClassifier,
+        MixedScriptRouter,
+        MergeTranscriptions,
+        LoadCalamariFrakturModel,
+    )
+    NODE_CLASS_MAPPINGS["CalamariFraktur"] = CalamariFrakturNode
+    NODE_CLASS_MAPPINGS["PrintedHandwrittenClassifier"] = PrintedHandwrittenClassifier
+    NODE_CLASS_MAPPINGS["MixedScriptRouter"] = MixedScriptRouter
+    NODE_CLASS_MAPPINGS["MergeTranscriptions"] = MergeTranscriptions
+    NODE_CLASS_MAPPINGS["LoadCalamariFrakturModel"] = LoadCalamariFrakturModel
+    NODE_DISPLAY_NAME_MAPPINGS["CalamariFraktur"] = "Calamari Fraktur OCR"
+    NODE_DISPLAY_NAME_MAPPINGS["PrintedHandwrittenClassifier"] = "Printed/Handwritten Classifier"
+    NODE_DISPLAY_NAME_MAPPINGS["MixedScriptRouter"] = "Mixed Script Router"
+    NODE_DISPLAY_NAME_MAPPINGS["MergeTranscriptions"] = "Merge Transcriptions"
+    NODE_DISPLAY_NAME_MAPPINGS["LoadCalamariFrakturModel"] = "Load Calamari Fraktur Model"
+except Exception as e:
+    logger.warning(f"Could not import calamari_nodes: {e}")
+
+try:
+    from .training_nodes import (
+        GTPreparationNode,
+        CalamariFinetuneNode,
+        TrOCRFinetuneNode,
+        DatasetDownloaderNode,
+    )
+    NODE_CLASS_MAPPINGS["GTPreparation"] = GTPreparationNode
+    NODE_CLASS_MAPPINGS["CalamariFinetuning"] = CalamariFinetuneNode
+    NODE_CLASS_MAPPINGS["TrOCRFinetuning"] = TrOCRFinetuneNode
+    NODE_CLASS_MAPPINGS["DatasetDownloader"] = DatasetDownloaderNode
+    NODE_DISPLAY_NAME_MAPPINGS["GTPreparation"] = "Ground Truth Preparation"
+    NODE_DISPLAY_NAME_MAPPINGS["CalamariFinetuning"] = "Calamari Fine-tuning"
+    NODE_DISPLAY_NAME_MAPPINGS["TrOCRFinetuning"] = "TrOCR Fine-tuning"
+    NODE_DISPLAY_NAME_MAPPINGS["DatasetDownloader"] = "Dataset Downloader"
+except Exception as e:
+    logger.warning(f"Could not import training_nodes: {e}")
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
