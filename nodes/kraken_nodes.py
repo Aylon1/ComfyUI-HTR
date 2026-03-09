@@ -215,7 +215,7 @@ class KrakenLineSegmentation:
             }
         }
 
-    RETURN_TYPES  = ("IMAGE", "JSON", "INT", "IMAGE")
+    RETURN_TYPES  = ("IMAGE", "STRING", "INT", "IMAGE")
     RETURN_NAMES  = ("cropped_lines", "bboxes", "count", "annotated_image")
     FUNCTION      = "segment"
     CATEGORY      = "Sütterlin HTR/Detection"

@@ -479,9 +479,31 @@ class KrakenHTRInference:
             raise ValueError(f"[KrakenHTRInference] Could not parse bboxes JSON: {e}")
 
         if not line_data:
-            _safe_print("[KrakenHTRInference] No lines in bboxes — returning empty results",
-                        flush=True)
-            return ("", "[]", "[]", "[]")
+            msg = (
+                "(no line bboxes provided — connect KrakenLineSegmentation.bboxes "
+                "→ KrakenMixedScriptRouter.line_bboxes_json, then wire "
+                "kurrent_bboxes_json / fraktur_bboxes_json → KrakenHTRInference.bboxes)"
+            )
+            _safe_print(f"[KrakenHTRInference] WARNING: {msg}", flush=True)
+            return (msg, "[]", "[]", "[]")
+
+        # ── 2b. Sanity-check: image must be the full document, not line crops ─
+        # Line crops from MixedScriptRouter are typically 64 px tall.
+        # The bboxes contain absolute document coordinates (y2 can be > 100).
+        # If the image height is smaller than the largest bbox y2, warn loudly.
+        pil_check = _tensor2pil(image)[0]
+        img_h_check = pil_check.size[1]
+        max_bbox_y2 = max((item["bbox"][3] for item in line_data
+                           if isinstance(item, dict) and "bbox" in item), default=0)
+        if max_bbox_y2 > img_h_check:
+            msg = (
+                f"(image height {img_h_check}px is smaller than bbox y2={max_bbox_y2}px — "
+                "KrakenHTRInference needs the FULL document image from LoadImage, "
+                "not the line crops from MixedScriptRouter. "
+                "Connect LoadImage.IMAGE → KrakenHTRInference.image)"
+            )
+            _safe_print(f"[KrakenHTRInference] ERROR: {msg}", flush=True)
+            return (msg, "[]", "[]", "[]")
 
         # ── 3. Convert image tensor → PIL → temp PNG ──────────────────────────
         pil_images = _tensor2pil(image)
