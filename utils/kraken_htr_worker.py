@@ -8,8 +8,9 @@ This script is intentionally self-contained: it imports ONLY packages
 available inside kraken_env (kraken, PIL/Pillow, numpy, torch).
 It must NOT import anything from the tjk_suetterlin package.
 
-USAGE:
+USAGE (line-level, default action=transcribe):
     kraken_env/bin/python utils/kraken_htr_worker.py \
+        --action transcribe \
         --image /path/to/image.png \
         --bboxes_json /path/to/bboxes.json \
         --model /path/to/model.mlmodel \
@@ -17,7 +18,16 @@ USAGE:
         [--pad 16] \
         [--bidi_reordering]
 
-STDOUT:
+USAGE (word-level, action=transcribe_words):
+    kraken_env/bin/python utils/kraken_htr_worker.py \
+        --action transcribe_words \
+        --image /path/to/paths.json \
+        --model /path/to/model.mlmodel \
+        [--device auto|cpu|cuda]
+
+    paths.json is a JSON array of absolute paths to individual word PNG files.
+
+STDOUT (action=transcribe):
     JSON array of line result objects:
     [
       {
@@ -32,6 +42,9 @@ STDOUT:
       },
       ...
     ]
+
+STDOUT (action=transcribe_words):
+    {"words": [{"text": "...", "confidence": 0.0}, ...], "error": null}
 
 STDERR:
     Human-readable progress/error messages (not parsed by caller).
@@ -233,16 +246,72 @@ def _extract_word_cuts(record):
         return []
 
 
+# ── Helper: load HTR model ────────────────────────────────────────────────────
+
+def _load_model(model_path, device):
+    """Load a Kraken HTR model, resolving device and trying fallbacks."""
+    try:
+        from kraken.lib.models import load_any
+        print(f"[kraken_htr_worker] Loading model: {model_path}", file=sys.stderr)
+        model = load_any(model_path, device=device)
+        print(f"[kraken_htr_worker] Model loaded OK", file=sys.stderr)
+        return model
+    except ImportError:
+        pass
+
+    # Fallback: try vgsl directly
+    try:
+        from kraken.lib import vgsl
+        print(f"[kraken_htr_worker] load_any not available; trying vgsl.TorchVGSLModel",
+              file=sys.stderr)
+        model = vgsl.TorchVGSLModel.load_model(model_path)
+        try:
+            import torch
+            if device == "cuda" and torch.cuda.is_available():
+                model.nn.cuda()
+            else:
+                model.nn.cpu()
+        except Exception:
+            pass
+        print(f"[kraken_htr_worker] Model loaded via vgsl OK", file=sys.stderr)
+        return model
+    except Exception as e2:
+        print(f"[kraken_htr_worker] ERROR: Could not load model: {e2}", file=sys.stderr)
+        sys.exit(3)
+
+
+# ── Helper: resolve device ────────────────────────────────────────────────────
+
+def _resolve_device(device_arg):
+    """Resolve 'auto' to 'cuda' or 'cpu'; return other values unchanged."""
+    if device_arg == "auto":
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"[kraken_htr_worker] Auto-selected device: {device}", file=sys.stderr)
+            return device
+        except ImportError:
+            print("[kraken_htr_worker] torch not available; using cpu", file=sys.stderr)
+            return "cpu"
+    return device_arg
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
         description="Kraken HTR inference worker — outputs JSON to stdout."
     )
+    parser.add_argument("--action",       default="transcribe",
+                        choices=["transcribe", "transcribe_words"],
+                        help="Action: 'transcribe' (line-level) or 'transcribe_words' "
+                             "(per-word, --image is a JSON paths list)")
     parser.add_argument("--image",        required=True,
-                        help="Path to input image file (full document)")
-    parser.add_argument("--bboxes_json",  required=True,
-                        help="Path to JSON file with line bboxes from kraken_worker.py")
+                        help="Path to input image file (full document), or for "
+                             "transcribe_words: path to JSON file listing word image paths")
+    parser.add_argument("--bboxes_json",  default=None,
+                        help="Path to JSON file with line bboxes (required for "
+                             "action=transcribe, unused for transcribe_words)")
     parser.add_argument("--model",        required=True,
                         help="Absolute path to .mlmodel file")
     parser.add_argument("--device",       default="cpu",
@@ -256,15 +325,24 @@ def main():
     args = parser.parse_args()
 
     bidi = args.bidi_reordering and not args.no_bidi
+    device = _resolve_device(args.device)
+    print(f"[kraken_htr_worker] Using device: {device}", file=sys.stderr)
+
+    # ── Dispatch on action ────────────────────────────────────────────────────
+    if args.action == "transcribe_words":
+        _action_transcribe_words(args, device)
+    else:
+        _action_transcribe(args, device, bidi)
+
+
+# ── Action: transcribe (line-level, original behaviour) ──────────────────────
+
+def _action_transcribe(args, device, bidi):
+    """Original line-level HTR: one full document image + bboxes JSON."""
 
     # ── Step 1: Load image ────────────────────────────────────────────────────
     try:
         from PIL import Image
-        # Disable PIL decompression-bomb guard: the image is a trusted temp file
-        # created by KrakenWordHTRInference (stacked word crops), not user input.
-        # Without this, stacking many word crops (e.g. 747) easily exceeds the
-        # default 178 MP limit and raises a DecompressionBombError (exit code 2).
-        Image.MAX_IMAGE_PIXELS = None
         image = Image.open(args.image).convert("RGB")
         print(f"[kraken_htr_worker] Loaded image: {args.image} {image.size}",
               file=sys.stderr)
@@ -278,6 +356,10 @@ def main():
         sys.exit(2)
 
     # ── Step 2: Load bboxes JSON ──────────────────────────────────────────────
+    if not args.bboxes_json:
+        print("[kraken_htr_worker] ERROR: --bboxes_json is required for action=transcribe",
+              file=sys.stderr)
+        sys.exit(1)
     try:
         with open(args.bboxes_json, "r", encoding="utf-8") as f:
             line_data = json.load(f)
@@ -298,55 +380,10 @@ def main():
         print(json.dumps([]))
         sys.exit(0)
 
-    # ── Step 3: Resolve device ────────────────────────────────────────────────
-    device = args.device
-    if device == "auto":
-        try:
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"[kraken_htr_worker] Auto-selected device: {device}", file=sys.stderr)
-        except ImportError:
-            device = "cpu"
-            print("[kraken_htr_worker] torch not available; using cpu", file=sys.stderr)
-    print(f"[kraken_htr_worker] Using device: {device}", file=sys.stderr)
+    # ── Step 3: Load model ────────────────────────────────────────────────────
+    model = _load_model(args.model, device)
 
-    # ── Step 4: Load HTR model ────────────────────────────────────────────────
-    try:
-        from kraken.lib.models import load_any
-        print(f"[kraken_htr_worker] Loading model: {args.model}", file=sys.stderr)
-        model = load_any(args.model, device=device)
-        print(f"[kraken_htr_worker] Model loaded OK", file=sys.stderr)
-    except ImportError:
-        # Fallback: try vgsl directly
-        try:
-            from kraken.lib import vgsl
-            print(f"[kraken_htr_worker] load_any not available; trying vgsl.TorchVGSLModel",
-                  file=sys.stderr)
-            model = vgsl.TorchVGSLModel.load_model(args.model)
-            # Move to device
-            try:
-                import torch
-                if device == "cuda" and torch.cuda.is_available():
-                    model.nn.cuda()
-                else:
-                    model.nn.cpu()
-            except Exception:
-                pass
-            print(f"[kraken_htr_worker] Model loaded via vgsl OK", file=sys.stderr)
-        except Exception as e2:
-            print(f"[kraken_htr_worker] ERROR: Could not load model: {e2}",
-                  file=sys.stderr)
-            sys.exit(3)
-    except FileNotFoundError:
-        print(f"[kraken_htr_worker] ERROR: Model file not found: {args.model}",
-              file=sys.stderr)
-        sys.exit(3)
-    except Exception as e:
-        print(f"[kraken_htr_worker] ERROR: Could not load model: {e}",
-              file=sys.stderr)
-        sys.exit(3)
-
-    # ── Step 5: Build Segmentation object ────────────────────────────────────
+    # ── Step 4: Build Segmentation object ────────────────────────────────────
     try:
         seg, api_ver = _build_segmentation(image, line_data)
     except Exception as e:
@@ -354,7 +391,7 @@ def main():
               file=sys.stderr)
         sys.exit(5)
 
-    # ── Step 6: Run rpred() inference ─────────────────────────────────────────
+    # ── Step 5: Run rpred() inference ─────────────────────────────────────────
     try:
         from kraken import rpred as kraken_rpred
         print(f"[kraken_htr_worker] Running rpred() on {len(line_data)} line(s) "
@@ -372,19 +409,14 @@ def main():
               file=sys.stderr)
         sys.exit(4)
 
-    # ── Step 7: Collect results ───────────────────────────────────────────────
+    # ── Step 6: Collect results ───────────────────────────────────────────────
     results = []
     for i, record in enumerate(pred_it):
         try:
             text = record.prediction or ""
-            # Per-character confidences → line average
             char_confs = getattr(record, "confidences", None) or []
-            if char_confs:
-                avg_conf = float(sum(char_confs) / len(char_confs))
-            else:
-                avg_conf = 0.0
+            avg_conf = float(sum(char_confs) / len(char_confs)) if char_confs else 0.0
 
-            # Line bbox from record or fall back to input bbox
             try:
                 rec_bbox = list(record.bbox)
             except (AttributeError, TypeError):
@@ -417,9 +449,98 @@ def main():
 
     print(f"[kraken_htr_worker] Inference complete: {len(results)} line(s) processed",
           file=sys.stderr)
-
-    # ── Only JSON goes to stdout ──────────────────────────────────────────────
     print(json.dumps(results, ensure_ascii=False))
+
+
+# ── Action: transcribe_words (per-word, no stacking) ─────────────────────────
+
+def _action_transcribe_words(args, device):
+    """
+    Process each word crop individually as a single-line document.
+
+    args.image is the path to a JSON file containing a list of absolute paths
+    to individual word PNG files (one per word).  Each word image is treated as
+    a single-line document: a Segmentation with one BBoxLine spanning the full
+    image is constructed and rpred() is called once per word.
+
+    Outputs to stdout:
+        {"words": [{"text": "...", "confidence": 0.0}, ...], "error": null}
+    """
+    from PIL import Image
+
+    # ── Step 1: Read the paths JSON ───────────────────────────────────────────
+    try:
+        with open(args.image, "r", encoding="utf-8") as f:
+            word_paths = json.load(f)
+        print(f"[kraken_htr_worker] transcribe_words: {len(word_paths)} word image(s)",
+              file=sys.stderr)
+    except FileNotFoundError:
+        print(f"[kraken_htr_worker] ERROR: paths JSON not found: {args.image}",
+              file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"[kraken_htr_worker] ERROR: Could not parse paths JSON: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not word_paths:
+        print("[kraken_htr_worker] No word paths — returning empty results", file=sys.stderr)
+        print(json.dumps({"words": [], "error": None}))
+        sys.exit(0)
+
+    # ── Step 2: Load model (once, shared across all words) ────────────────────
+    model = _load_model(args.model, device)
+
+    # ── Step 3: Process each word crop individually ───────────────────────────
+    try:
+        from kraken import rpred as kraken_rpred
+    except ImportError as e:
+        print(f"[kraken_htr_worker] ERROR: Could not import kraken.rpred: {e}",
+              file=sys.stderr)
+        sys.exit(4)
+
+    results = []
+    for word_idx, word_path in enumerate(word_paths):
+        try:
+            word_img = Image.open(word_path).convert("RGB")
+            w, h = word_img.size
+
+            # Build a single-line Segmentation spanning the full word image
+            single_line = [{"bbox": [0, 0, w, h]}]
+            seg, _ = _build_segmentation(word_img, single_line)
+
+            pred_it = kraken_rpred.rpred(
+                network=model,
+                im=word_img,
+                bounds=seg,
+                pad=0,           # no padding: word crop is already tight
+                bidi_reordering=False,  # word-level: no bidi needed
+            )
+
+            record = next(iter(pred_it), None)
+            if record is not None:
+                text = record.prediction or ""
+                char_confs = getattr(record, "confidences", None) or []
+                avg_conf = float(sum(char_confs) / len(char_confs)) if char_confs else 0.0
+                results.append({
+                    "text": text,
+                    "confidence": round(avg_conf, 4),
+                })
+                print(f"[kraken_htr_worker] Word {word_idx}: {repr(text[:40])} "
+                      f"(conf={avg_conf:.3f})", file=sys.stderr)
+            else:
+                results.append({"text": "", "confidence": 0.0})
+                print(f"[kraken_htr_worker] Word {word_idx}: no prediction",
+                      file=sys.stderr)
+
+        except Exception as e:
+            print(f"[kraken_htr_worker] WARNING: Word {word_idx} failed ({word_path}): {e}",
+                  file=sys.stderr)
+            results.append({"text": "", "confidence": 0.0})
+
+    print(f"[kraken_htr_worker] transcribe_words complete: {len(results)} word(s)",
+          file=sys.stderr)
+    print(json.dumps({"words": results, "error": None}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -1047,8 +1047,10 @@ class KrakenWordHTRInference:
 
     Unlike KrakenHTRInference (which needs the full document image + absolute
     bboxes), this node accepts a batch of word image crops directly.  Each crop
-    is treated as a single-line document: all crops are stacked vertically into
-    one tall image and a synthetic bbox list is passed to the worker.
+    is saved as an individual temp PNG and processed by the worker as a
+    single-line document (action=transcribe_words).  This avoids the memory
+    exhaustion and incorrect inference caused by stacking hundreds of crops into
+    one giant image.
 
     Typical use: connect KrakenWordSegmentation.word_images here after routing
     through KrakenMixedScriptRouter (word_mode=True).
@@ -1085,7 +1087,6 @@ class KrakenWordHTRInference:
                     "tooltip": "String used to join word transcriptions.",
                 }),
                 "device": (["auto", "cpu", "cuda"], {"default": "auto"}),
-                "pad":    ("INT", {"default": 4, "min": 0, "max": 32}),
             },
         }
 
@@ -1093,8 +1094,9 @@ class KrakenWordHTRInference:
                          kraken_htr_model,
                          word_bboxes_json: str = "[]",
                          separator: str = " ",
-                         device: str = "auto",
-                         pad: int = 4):
+                         device: str = "auto"):
+
+        import shutil
 
         # ── 1. Validate model ─────────────────────────────────────────────────
         if not isinstance(kraken_htr_model, dict) or "path" not in kraken_htr_model:
@@ -1115,51 +1117,41 @@ class KrakenWordHTRInference:
         if n_words == 0:
             return ("", "[]")
 
-        # ── 3. Stack all word crops vertically into one tall image ────────────
-        # The worker receives one image + one bbox per word.
-        # Each bbox covers exactly one word crop in the stacked image.
-        max_w = max(img.size[0] for img in pil_words)
-        total_h = sum(img.size[1] for img in pil_words)
-        stacked = Image.new("RGB", (max_w, total_h), (255, 255, 255))
-        stacked_bboxes = []
-        y_offset = 0
-        for pil_img in pil_words:
-            w, h = pil_img.size
-            stacked.paste(pil_img.convert("RGB"), (0, y_offset))
-            stacked_bboxes.append({"bbox": [0, y_offset, w, y_offset + h]})
-            y_offset += h
-
-        tmp_image_path  = None
-        tmp_bboxes_path = None
+        # ── 3. Normalize each word crop to 64 px height and save as temp PNG ──
+        # Kraken's rpred() is designed for line-level images normalised to ~64 px.
+        # Saving each crop individually avoids PIL DecompressionBombError and
+        # ensures correct single-line inference (no synthetic stacked bboxes).
+        tmpdir = tempfile.mkdtemp(prefix="kraken_words_")
         try:
-            with tempfile.NamedTemporaryFile(
-                suffix=".png", prefix="kraken_word_img_", delete=False
-            ) as f:
-                tmp_image_path = f.name
-            stacked.save(tmp_image_path, format="PNG")
+            word_paths = []
+            for i, pil_img in enumerate(pil_words):
+                pil_img = pil_img.convert("RGB")
+                w, h = pil_img.size
+                if h != 64 and h > 0:
+                    new_w = max(1, int(w * 64 / h))
+                    pil_img = pil_img.resize((new_w, 64), Image.LANCZOS)
+                path = os.path.join(tmpdir, f"word_{i:04d}.png")
+                pil_img.save(path, format="PNG")
+                word_paths.append(path)
 
-            with tempfile.NamedTemporaryFile(
-                suffix=".json", prefix="kraken_word_bboxes_", delete=False,
-                mode="w", encoding="utf-8",
-            ) as f:
-                tmp_bboxes_path = f.name
-                json.dump(stacked_bboxes, f, ensure_ascii=False)
+            # Write the list of paths as a JSON file for the worker
+            paths_json = os.path.join(tmpdir, "paths.json")
+            with open(paths_json, "w", encoding="utf-8") as f:
+                json.dump(word_paths, f, ensure_ascii=False)
 
             # ── 4. Build subprocess command ───────────────────────────────────
             cmd = [
                 KRAKEN_ENV_PYTHON,
                 HTR_WORKER_SCRIPT,
-                "--image",       tmp_image_path,
-                "--bboxes_json", tmp_bboxes_path,
-                "--model",       model_path,
-                "--device",      device,
-                "--pad",         str(pad),
-                "--no_bidi",     # word crops: no bidi reordering needed
+                "--action",  "transcribe_words",
+                "--image",   paths_json,
+                "--model",   model_path,
+                "--device",  device,
             ]
 
             _safe_print(
                 f"[KrakenWordHTRInference] Running HTR on {n_words} word crop(s) "
-                f"with model: {os.path.basename(model_path)}",
+                f"(action=transcribe_words) with model: {os.path.basename(model_path)}",
                 flush=True,
             )
 
@@ -1169,12 +1161,12 @@ class KrakenWordHTRInference:
                     cmd,
                     capture_output=True,
                     text=True,
-                    timeout=300,
+                    timeout=600,   # allow more time: one rpred() call per word
                     env=_clean_env(),
                 )
             except subprocess.TimeoutExpired:
                 raise RuntimeError(
-                    "[KrakenWordHTRInference] Worker timed out after 300 s."
+                    "[KrakenWordHTRInference] Worker timed out after 600 s."
                 )
 
             if proc.stderr:
@@ -1196,22 +1188,29 @@ class KrakenWordHTRInference:
                 )
 
             try:
-                results = json.loads(raw)
+                result_obj = json.loads(raw)
             except json.JSONDecodeError as e:
                 raise RuntimeError(
                     f"[KrakenWordHTRInference] Could not parse worker JSON: {e}\n"
                     f"Raw stdout: {raw[:500]}"
                 )
 
+            # Worker returns {"words": [...], "error": null}
+            if isinstance(result_obj, dict) and "words" in result_obj:
+                word_results = result_obj["words"]
+            else:
+                # Fallback: accept a bare list (forward-compat)
+                word_results = result_obj if isinstance(result_obj, list) else []
+
             # ── 7. Build outputs ──────────────────────────────────────────────
-            texts       = [r.get("text", "") for r in results]
-            confidences = [r.get("confidence", 0.0) for r in results]
+            texts       = [r.get("text", "") for r in word_results]
+            confidences = [r.get("confidence", 0.0) for r in word_results]
 
             transcription    = separator.join(t for t in texts if t)
             confidences_json = json.dumps(confidences)
 
             _safe_print(
-                f"[KrakenWordHTRInference] Done: {len(results)} word(s) transcribed. "
+                f"[KrakenWordHTRInference] Done: {len(word_results)} word(s) transcribed. "
                 f"Result: {repr(transcription[:80])}",
                 flush=True,
             )
@@ -1219,9 +1218,4 @@ class KrakenWordHTRInference:
             return (transcription, confidences_json)
 
         finally:
-            for p in (tmp_image_path, tmp_bboxes_path):
-                if p and os.path.exists(p):
-                    try:
-                        os.unlink(p)
-                    except OSError:
-                        pass
+            shutil.rmtree(tmpdir, ignore_errors=True)
