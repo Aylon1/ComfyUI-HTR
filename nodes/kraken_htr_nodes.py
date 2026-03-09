@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 
 
@@ -44,39 +45,55 @@ KRAKEN_HTR_MODELS_DIR = os.path.join(_COMFYUI_DIR, "models", "kraken_htr")
 
 # ── Model registry ────────────────────────────────────────────────────────────
 
+# ── Zenodo URL helper ─────────────────────────────────────────────────────────
+def _zenodo_content_url(record_id, filename):
+    """Return the canonical Zenodo API content download URL for a file."""
+    return f"https://zenodo.org/api/records/{record_id}/files/{filename}/content"
+
+
 KRAKEN_HTR_MODEL_REGISTRY = {
+    # Record 7933463: "HTR model for German manuscripts trained from several datasets"
+    # Creator: Stefan Weil (UB Mannheim). Actual file: german_handwriting.mlmodel
+    # Verified via Zenodo API 2026-03-09.
     "ub_mannheim_kurrent_2023": {
-        "display": "UB Mannheim German Kurrent 2023 (CER ~3.5%)",
+        "display": "UB Mannheim German Handwriting 2023 (Weil, ~16 MB)",
         "script": "kurrent",
         "century": "19th",
-        "cer": 3.5,
+        "cer": None,
         "zenodo_record": "7933463",
-        "filename": "german_kurrent_best.mlmodel",
-        "download_url": "https://zenodo.org/records/7933463/files/german_kurrent_best.mlmodel",
+        "filename": "german_handwriting.mlmodel",
+        "download_url": _zenodo_content_url("7933463", "german_handwriting.mlmodel"),
         "local_subdir": "kurrent_ub_mannheim_2023",
-        "size_mb": 45,
+        "size_mb": 16,
     },
+    # Record 7089018: "Preliminary Fraktur model"
+    # Creator: Benjamin Kiessling. Trained on Austrian/Swiss/Swedish newspapers
+    # + UB Mannheim and Göttingen collections + OCR-D corpus.
+    # Actual file: fraktur_all_2.mlmodel. Verified via Zenodo API 2026-03-09.
     "ub_mannheim_kurrent_2022": {
-        "display": "UB Mannheim German Kurrent 2022 (CER ~5.2%)",
-        "script": "kurrent",
-        "century": "19th",
-        "cer": 5.2,
-        "zenodo_record": "6657809",
-        "filename": "german_kurrent_2022.mlmodel",
-        "download_url": "https://zenodo.org/records/6657809/files/german_kurrent_2022.mlmodel",
-        "local_subdir": "kurrent_ub_mannheim_2022",
-        "size_mb": 42,
-    },
-    "ub_mannheim_fraktur_2023": {
-        "display": "UB Mannheim German Fraktur Print 2023 (CER ~1.8%)",
+        "display": "Kiessling Preliminary Fraktur (UB Mannheim + OCR-D, ~16 MB)",
         "script": "fraktur",
-        "century": "17th-20th",
-        "cer": 1.8,
-        "zenodo_record": "6657809",
-        "filename": "german_print_best.mlmodel",
-        "download_url": "https://zenodo.org/records/6657809/files/german_print_best.mlmodel",
+        "century": "19th-20th",
+        "cer": None,
+        "zenodo_record": "7089018",
+        "filename": "fraktur_all_2.mlmodel",
+        "download_url": _zenodo_content_url("7089018", "fraktur_all_2.mlmodel"),
+        "local_subdir": "fraktur_kiessling_2022",
+        "size_mb": 16,
+    },
+    # Record 7933402: "Fraktur model trained from enhanced Austrian Newspapers dataset"
+    # Creator: Stefan Weil (UB Mannheim). 19th century German Fraktur.
+    # Actual file: austriannewspapers.mlmodel. Verified via Zenodo API 2026-03-09.
+    "ub_mannheim_fraktur_2023": {
+        "display": "UB Mannheim Austrian Newspapers Fraktur 2023 (Weil, ~16 MB)",
+        "script": "fraktur",
+        "century": "19th",
+        "cer": None,
+        "zenodo_record": "7933402",
+        "filename": "austriannewspapers.mlmodel",
+        "download_url": _zenodo_content_url("7933402", "austriannewspapers.mlmodel"),
         "local_subdir": "fraktur_ub_mannheim_2023",
-        "size_mb": 48,
+        "size_mb": 16,
     },
     "custom": {
         "display": "Custom model (provide path below)",
@@ -151,11 +168,76 @@ def _empty_image_tensor(h=64, w=64):
 
 # ── Download helper ───────────────────────────────────────────────────────────
 
+def _zenodo_api_find_url(record_id, filename):
+    """
+    Query the Zenodo REST API for record_id and return the content URL for
+    the file matching `filename` (case-insensitive).  Returns None if not found.
+    """
+    api_url = f"https://zenodo.org/api/records/{record_id}"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "ComfyUI-HTR/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        files = data.get("files", [])
+        for f in files:
+            key = f.get("key", "")
+            if key.lower() == filename.lower():
+                url = f.get("links", {}).get("self", "")
+                if url:
+                    _safe_print(
+                        f"[KrakenHTRModelLoader] Zenodo API found '{key}' → {url}",
+                        flush=True,
+                    )
+                    return url
+        # File not found — log available files to help debugging
+        available = [f.get("key", "?") for f in files]
+        _safe_print(
+            f"[KrakenHTRModelLoader] Zenodo API: record {record_id} has no file "
+            f"named '{filename}'. Available: {available}",
+            flush=True,
+        )
+    except Exception as e:
+        _safe_print(
+            f"[KrakenHTRModelLoader] Zenodo API query failed for record {record_id}: {e}",
+            flush=True,
+        )
+    return None
+
+
+def _stream_download(url, target_path, filename, size_mb):
+    """Streaming download with 1 MB chunks and progress logging."""
+    req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-HTR/1.0"})
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        total = int(resp.headers.get("Content-Length", 0))
+        downloaded = 0
+        chunk_size = 1024 * 1024  # 1 MB
+        with open(target_path, "wb") as f:
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    pct = downloaded / total * 100
+                    _safe_print(
+                        f"[KrakenHTRModelLoader] {downloaded // (1024 * 1024)} MB / "
+                        f"{total // (1024 * 1024)} MB ({pct:.0f}%)",
+                        flush=True,
+                    )
+
+
 def _download_kraken_htr_model(model_key, models_base_dir, registry, force_redownload=False):
     """
     Download a Kraken HTR .mlmodel file from Zenodo.
     Returns the absolute path to the downloaded file.
     Skips download if file already exists (unless force_redownload=True).
+
+    Strategy:
+      1. Try the registry ``download_url`` directly.
+      2. On HTTP 404, query the Zenodo REST API for the record to find the
+         correct content URL (handles filename drift between registry and Zenodo).
+      3. Raise RuntimeError with actionable message if both attempts fail.
     """
     if registry.get("download_url") is None:
         raise ValueError(
@@ -175,29 +257,58 @@ def _download_kraken_htr_model(model_key, models_base_dir, registry, force_redow
     os.makedirs(target_dir, exist_ok=True)
     url = registry["download_url"]
     size_mb = registry.get("size_mb", "?")
-    _safe_print(f"[KrakenHTRModelLoader] Downloading {filename} (~{size_mb} MB) from:\n"
-                f"  {url}", flush=True)
+    record_id = registry.get("zenodo_record")
 
-    # Streaming download with progress
+    _safe_print(
+        f"[KrakenHTRModelLoader] Downloading {filename} (~{size_mb} MB) from:\n  {url}",
+        flush=True,
+    )
+
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-HTR/1.0"})
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
-            chunk_size = 1024 * 1024  # 1 MB chunks
-            with open(target_path, "wb") as f:
-                while True:
-                    chunk = resp.read(chunk_size)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total > 0:
-                        pct = downloaded / total * 100
-                        _safe_print(f"[KrakenHTRModelLoader] {downloaded // (1024*1024)} MB / "
-                                    f"{total // (1024*1024)} MB ({pct:.0f}%)", flush=True)
+        _stream_download(url, target_path, filename, size_mb)
+    except urllib.error.HTTPError as e:
+        if e.code == 404 and record_id:
+            # ── Fallback: query Zenodo API to find the real content URL ──────
+            _safe_print(
+                f"[KrakenHTRModelLoader] Got HTTP 404 for {url}\n"
+                f"  Querying Zenodo API for record {record_id} to find correct URL…",
+                flush=True,
+            )
+            if os.path.exists(target_path):
+                os.remove(target_path)
+            fallback_url = _zenodo_api_find_url(record_id, filename)
+            if fallback_url is None:
+                raise RuntimeError(
+                    f"[KrakenHTRModelLoader] Download failed: '{filename}' not found in "
+                    f"Zenodo record {record_id}.\n"
+                    f"Original URL: {url}\n"
+                    f"Check https://zenodo.org/records/{record_id} for the correct filename "
+                    f"and update KRAKEN_HTR_MODEL_REGISTRY.\n"
+                    f"Or download manually and place at: {target_path}"
+                )
+            _safe_print(
+                f"[KrakenHTRModelLoader] Retrying download from API URL:\n  {fallback_url}",
+                flush=True,
+            )
+            try:
+                _stream_download(fallback_url, target_path, filename, size_mb)
+            except Exception as e2:
+                if os.path.exists(target_path):
+                    os.remove(target_path)
+                raise RuntimeError(
+                    f"[KrakenHTRModelLoader] Download failed on API fallback URL: {e2}\n"
+                    f"URL: {fallback_url}\n"
+                    f"Try downloading manually and placing at: {target_path}"
+                )
+        else:
+            if os.path.exists(target_path):
+                os.remove(target_path)
+            raise RuntimeError(
+                f"[KrakenHTRModelLoader] Download failed for {filename}: {e}\n"
+                f"URL: {url}\n"
+                f"Try downloading manually and placing at: {target_path}"
+            )
     except Exception as e:
-        # Clean up partial download
         if os.path.exists(target_path):
             os.remove(target_path)
         raise RuntimeError(
