@@ -137,16 +137,19 @@ try:
         KrakenHTRModelLoader,
         KrakenHTRInference,
         KrakenWordSegmentation,
-        MixedScriptRouter as KrakenMixedScriptRouter,
+        KrakenMixedScriptRouter,
+        KrakenWordHTRInference,
     )
     NODE_CLASS_MAPPINGS["KrakenHTRModelLoader"] = KrakenHTRModelLoader
     NODE_CLASS_MAPPINGS["KrakenHTRInference"] = KrakenHTRInference
     NODE_CLASS_MAPPINGS["KrakenWordSegmentation"] = KrakenWordSegmentation
     NODE_CLASS_MAPPINGS["KrakenMixedScriptRouter"] = KrakenMixedScriptRouter
+    NODE_CLASS_MAPPINGS["KrakenWordHTRInference"] = KrakenWordHTRInference
     NODE_DISPLAY_NAME_MAPPINGS["KrakenHTRModelLoader"] = "Kraken HTR Model Loader"
     NODE_DISPLAY_NAME_MAPPINGS["KrakenHTRInference"] = "Kraken HTR Inference"
     NODE_DISPLAY_NAME_MAPPINGS["KrakenWordSegmentation"] = "Kraken Word Segmentation"
     NODE_DISPLAY_NAME_MAPPINGS["KrakenMixedScriptRouter"] = "Mixed Script Router (Kraken)"
+    NODE_DISPLAY_NAME_MAPPINGS["KrakenWordHTRInference"] = "Kraken Word HTR Inference"
 except Exception as e:
     logger.warning(f"Could not import kraken_htr_nodes: {e}")
 

@@ -876,68 +876,92 @@ class KrakenWordSegmentation:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Node 4: MixedScriptRouter
+# Node 4: KrakenMixedScriptRouter  (was: MixedScriptRouter)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class MixedScriptRouter:
+class KrakenMixedScriptRouter:
     """
-    Routes line images to appropriate HTR model based on classification labels
-    from PrintedHandwrittenClassifier (in calamari_nodes.py).
+    Routes line (or word) images to the appropriate HTR model based on
+    classification labels from PrintedHandwrittenClassifierV2.
 
-    Handwritten lines → kurrent_lines output (for KrakenHTRInference with kurrent model)
-    Printed lines     → fraktur_lines output (for KrakenHTRInference with fraktur model)
+    Line mode (word_mode=False, default):
+      - Input: images batch + bboxes_json (flat list of bbox dicts from
+        KrakenLineSegmentation)
+      - Labels indexed by position in the batch (index 0..B-1)
+      - kurrent_bboxes_json / fraktur_bboxes_json: flat bbox lists
+
+    Word mode (word_mode=True):
+      - Input: word_images batch + bboxes_json (flat word bbox list from
+        KrakenWordSegmentation word_bboxes_json)
+      - Labels indexed by position in the batch (index 0..B-1)
+      - routing_json keys are "line_idx:word_idx" → "kurrent"/"fraktur"
+
+    Handwritten → kurrent output  (for KrakenHTRInference / KrakenWordHTRInference)
+    Printed     → fraktur output  (for KrakenHTRInference / KrakenWordHTRInference)
 
     When one sub-batch is empty, returns a 1×64×64×3 white placeholder tensor
     (ComfyUI cannot handle zero-batch tensors).
-
-    Returns routing_json mapping original line index → script type, compatible
-    with PageXMLMerger.
     """
 
     CATEGORY     = "Sütterlin HTR/Kraken"
     FUNCTION     = "route"
     RETURN_TYPES = ("IMAGE", "IMAGE", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("kurrent_lines", "fraktur_lines",
+    RETURN_NAMES = ("kurrent_images", "fraktur_images",
                     "kurrent_bboxes_json", "fraktur_bboxes_json", "routing_json")
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "line_images":      ("IMAGE",),
-                "line_bboxes_json": ("STRING", {
+                "images":      ("IMAGE",),
+                "bboxes_json": ("STRING", {
                     "multiline": False,
-                    "tooltip": "JSON from KrakenLineSegmentation bboxes output",
+                    "tooltip": (
+                        "Line mode: JSON from KrakenLineSegmentation bboxes output. "
+                        "Word mode: flat word_bboxes_json from KrakenWordSegmentation."
+                    ),
                 }),
-                "labels_json":      ("STRING", {
+                "labels_json": ("STRING", {
                     "multiline": False,
-                    "tooltip": "classification_json from PrintedHandwrittenClassifier",
+                    "tooltip": "labels_json from PrintedHandwrittenClassifierV2",
                 }),
-            }
+            },
+            "optional": {
+                "word_mode": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "False (default): line-level routing. "
+                        "True: word-level routing — bboxes_json must be the flat "
+                        "word_bboxes_json from KrakenWordSegmentation."
+                    ),
+                }),
+            },
         }
 
-    def route(self, line_images: torch.Tensor, line_bboxes_json: str,
-              labels_json: str):
+    def route(self, images: torch.Tensor, bboxes_json: str,
+              labels_json: str, word_mode: bool = False):
 
         # ── Parse labels ──────────────────────────────────────────────────────
         try:
             labels = json.loads(labels_json) if labels_json.strip() else []
         except json.JSONDecodeError as e:
-            _safe_print(f"[MixedScriptRouter] Could not parse labels_json: {e}", flush=True)
+            _safe_print(f"[KrakenMixedScriptRouter] Could not parse labels_json: {e}",
+                        flush=True)
             labels = []
 
         # ── Parse bboxes ──────────────────────────────────────────────────────
         try:
-            all_bboxes = json.loads(line_bboxes_json) if line_bboxes_json.strip() else []
+            all_bboxes = json.loads(bboxes_json) if bboxes_json.strip() else []
         except json.JSONDecodeError as e:
-            _safe_print(f"[MixedScriptRouter] Could not parse line_bboxes_json: {e}", flush=True)
+            _safe_print(f"[KrakenMixedScriptRouter] Could not parse bboxes_json: {e}",
+                        flush=True)
             all_bboxes = []
 
-        B = line_images.shape[0]
+        B = images.shape[0]
 
-        # Build label lookup: index → label
-        # labels_json from PrintedHandwrittenClassifier is:
-        # [{"index": 0, "label": "printed"|"handwritten", "variance": ...}, ...]
+        # Build label lookup: batch_index → label
+        # labels_json from PrintedHandwrittenClassifierV2:
+        # [{"index": 0, "label": "printed"|"handwritten", ...}, ...]
         label_map = {}
         for item in labels:
             if isinstance(item, dict):
@@ -945,7 +969,7 @@ class MixedScriptRouter:
                 lbl = item.get("label", "handwritten")
                 label_map[idx] = lbl
 
-        # Classify each line
+        # ── Route each image ──────────────────────────────────────────────────
         kurrent_indices = []
         fraktur_indices = []
         routing = {}
@@ -954,48 +978,250 @@ class MixedScriptRouter:
             lbl = label_map.get(i, "handwritten")
             if lbl == "printed":
                 fraktur_indices.append(i)
-                routing[str(i)] = "fraktur"
+                if word_mode and i < len(all_bboxes):
+                    bbox_item = all_bboxes[i]
+                    li = bbox_item.get("line_idx", bbox_item.get("line_index", 0))
+                    wi = bbox_item.get("word_idx", bbox_item.get("word_index", i))
+                    routing[f"{li}:{wi}"] = "fraktur"
+                else:
+                    routing[str(i)] = "fraktur"
             else:
                 kurrent_indices.append(i)
-                routing[str(i)] = "kurrent"
+                if word_mode and i < len(all_bboxes):
+                    bbox_item = all_bboxes[i]
+                    li = bbox_item.get("line_idx", bbox_item.get("line_index", 0))
+                    wi = bbox_item.get("word_idx", bbox_item.get("word_index", i))
+                    routing[f"{li}:{wi}"] = "kurrent"
+                else:
+                    routing[str(i)] = "kurrent"
 
         placeholder = torch.ones(1, 64, 64, 3, dtype=torch.float32)
 
         # Build image sub-batches
-        if kurrent_indices:
-            kurrent_lines = line_images[kurrent_indices]
-        else:
-            kurrent_lines = placeholder
+        kurrent_images = images[kurrent_indices] if kurrent_indices else placeholder
+        fraktur_images = images[fraktur_indices] if fraktur_indices else placeholder
 
-        if fraktur_indices:
-            fraktur_lines = line_images[fraktur_indices]
-        else:
-            fraktur_lines = placeholder
-
-        # Build bbox sub-lists
-        kurrent_bboxes = [all_bboxes[i] for i in kurrent_indices
-                          if i < len(all_bboxes)]
-        fraktur_bboxes = [all_bboxes[i] for i in fraktur_indices
-                          if i < len(all_bboxes)]
+        # Build bbox sub-lists (preserve original bbox dicts)
+        kurrent_bboxes = [all_bboxes[i] for i in kurrent_indices if i < len(all_bboxes)]
+        fraktur_bboxes = [all_bboxes[i] for i in fraktur_indices if i < len(all_bboxes)]
 
         # Build routing_json compatible with PageXMLMerger and MergeTranscriptions
         routing_full = {
-            "kurrent_indices":       kurrent_indices,
-            "fraktur_indices":       fraktur_indices,
-            "printed_indices":       fraktur_indices,    # alias for MergeTranscriptions compat
-            "handwritten_indices":   kurrent_indices,    # alias
-            "total":                 B,
-            "script_map":            routing,
+            "kurrent_indices":     kurrent_indices,
+            "fraktur_indices":     fraktur_indices,
+            "printed_indices":     fraktur_indices,   # alias for MergeTranscriptions compat
+            "handwritten_indices": kurrent_indices,   # alias
+            "total":               B,
+            "word_mode":           word_mode,
+            "script_map":          routing,
         }
 
-        _safe_print(f"[MixedScriptRouter] {len(kurrent_indices)} kurrent (handwritten), "
-                    f"{len(fraktur_indices)} fraktur (printed) from {B} total lines.",
-                    flush=True)
+        mode_str = "word" if word_mode else "line"
+        _safe_print(
+            f"[KrakenMixedScriptRouter] {len(kurrent_indices)} kurrent (handwritten), "
+            f"{len(fraktur_indices)} fraktur (printed) from {B} total {mode_str}s.",
+            flush=True,
+        )
 
         return (
-            kurrent_lines,
-            fraktur_lines,
+            kurrent_images,
+            fraktur_images,
             json.dumps(kurrent_bboxes, ensure_ascii=False),
             json.dumps(fraktur_bboxes, ensure_ascii=False),
             json.dumps(routing_full, ensure_ascii=False),
         )
+
+
+# Keep the old name as an alias so existing workflows that import MixedScriptRouter
+# from kraken_htr_nodes still work.
+MixedScriptRouter = KrakenMixedScriptRouter
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Node 5: KrakenWordHTRInference
+# ══════════════════════════════════════════════════════════════════════════════
+
+class KrakenWordHTRInference:
+    """
+    Runs Kraken HTR on pre-cropped word images.
+
+    Unlike KrakenHTRInference (which needs the full document image + absolute
+    bboxes), this node accepts a batch of word image crops directly.  Each crop
+    is treated as a single-line document: all crops are stacked vertically into
+    one tall image and a synthetic bbox list is passed to the worker.
+
+    Typical use: connect KrakenWordSegmentation.word_images here after routing
+    through KrakenMixedScriptRouter (word_mode=True).
+
+    Outputs:
+      - transcription: words joined by `separator` (default " ")
+      - confidences_json: list of per-word confidence floats
+    """
+
+    CATEGORY     = "Sütterlin HTR/Kraken"
+    FUNCTION     = "transcribe_words"
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("transcription", "confidences_json")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "word_images":      ("IMAGE",),
+                "kraken_htr_model": ("KRAKEN_HTR_MODEL",),
+            },
+            "optional": {
+                "word_bboxes_json": ("STRING", {
+                    "default": "[]",
+                    "multiline": False,
+                    "tooltip": (
+                        "word_bboxes_json from KrakenWordSegmentation or "
+                        "KrakenMixedScriptRouter — used only for metadata in output, "
+                        "not required for inference."
+                    ),
+                }),
+                "separator": ("STRING", {
+                    "default": " ",
+                    "tooltip": "String used to join word transcriptions.",
+                }),
+                "device": (["auto", "cpu", "cuda"], {"default": "auto"}),
+                "pad":    ("INT", {"default": 4, "min": 0, "max": 32}),
+            },
+        }
+
+    def transcribe_words(self, word_images: torch.Tensor,
+                         kraken_htr_model,
+                         word_bboxes_json: str = "[]",
+                         separator: str = " ",
+                         device: str = "auto",
+                         pad: int = 4):
+
+        # ── 1. Validate model ─────────────────────────────────────────────────
+        if not isinstance(kraken_htr_model, dict) or "path" not in kraken_htr_model:
+            raise ValueError(
+                "[KrakenWordHTRInference] kraken_htr_model must be a KRAKEN_HTR_MODEL dict "
+                "from KrakenHTRModelLoader."
+            )
+        model_path = kraken_htr_model["path"]
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(
+                f"[KrakenWordHTRInference] Model file not found: {model_path}"
+            )
+
+        # ── 2. Convert word image batch → list of PIL images ──────────────────
+        pil_words = _tensor2pil(word_images)
+        n_words = len(pil_words)
+
+        if n_words == 0:
+            return ("", "[]")
+
+        # ── 3. Stack all word crops vertically into one tall image ────────────
+        # The worker receives one image + one bbox per word.
+        # Each bbox covers exactly one word crop in the stacked image.
+        max_w = max(img.size[0] for img in pil_words)
+        total_h = sum(img.size[1] for img in pil_words)
+        stacked = Image.new("RGB", (max_w, total_h), (255, 255, 255))
+        stacked_bboxes = []
+        y_offset = 0
+        for pil_img in pil_words:
+            w, h = pil_img.size
+            stacked.paste(pil_img.convert("RGB"), (0, y_offset))
+            stacked_bboxes.append({"bbox": [0, y_offset, w, y_offset + h]})
+            y_offset += h
+
+        tmp_image_path  = None
+        tmp_bboxes_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".png", prefix="kraken_word_img_", delete=False
+            ) as f:
+                tmp_image_path = f.name
+            stacked.save(tmp_image_path, format="PNG")
+
+            with tempfile.NamedTemporaryFile(
+                suffix=".json", prefix="kraken_word_bboxes_", delete=False,
+                mode="w", encoding="utf-8",
+            ) as f:
+                tmp_bboxes_path = f.name
+                json.dump(stacked_bboxes, f, ensure_ascii=False)
+
+            # ── 4. Build subprocess command ───────────────────────────────────
+            cmd = [
+                KRAKEN_ENV_PYTHON,
+                HTR_WORKER_SCRIPT,
+                "--image",       tmp_image_path,
+                "--bboxes_json", tmp_bboxes_path,
+                "--model",       model_path,
+                "--device",      device,
+                "--pad",         str(pad),
+                "--no_bidi",     # word crops: no bidi reordering needed
+            ]
+
+            _safe_print(
+                f"[KrakenWordHTRInference] Running HTR on {n_words} word crop(s) "
+                f"with model: {os.path.basename(model_path)}",
+                flush=True,
+            )
+
+            # ── 5. Run subprocess ─────────────────────────────────────────────
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    env=_clean_env(),
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    "[KrakenWordHTRInference] Worker timed out after 300 s."
+                )
+
+            if proc.stderr:
+                for line in proc.stderr.strip().splitlines():
+                    _safe_print(f"  [kraken_htr_worker] {line}", flush=True)
+
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"[KrakenWordHTRInference] Worker exited with code {proc.returncode}.\n"
+                    f"stderr:\n{proc.stderr}"
+                )
+
+            # ── 6. Parse JSON output ──────────────────────────────────────────
+            raw = proc.stdout.strip()
+            if not raw:
+                raise RuntimeError(
+                    "[KrakenWordHTRInference] Worker produced no output on stdout.\n"
+                    f"stderr:\n{proc.stderr}"
+                )
+
+            try:
+                results = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(
+                    f"[KrakenWordHTRInference] Could not parse worker JSON: {e}\n"
+                    f"Raw stdout: {raw[:500]}"
+                )
+
+            # ── 7. Build outputs ──────────────────────────────────────────────
+            texts       = [r.get("text", "") for r in results]
+            confidences = [r.get("confidence", 0.0) for r in results]
+
+            transcription    = separator.join(t for t in texts if t)
+            confidences_json = json.dumps(confidences)
+
+            _safe_print(
+                f"[KrakenWordHTRInference] Done: {len(results)} word(s) transcribed. "
+                f"Result: {repr(transcription[:80])}",
+                flush=True,
+            )
+
+            return (transcription, confidences_json)
+
+        finally:
+            for p in (tmp_image_path, tmp_bboxes_path):
+                if p and os.path.exists(p):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass

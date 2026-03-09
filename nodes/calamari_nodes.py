@@ -855,27 +855,51 @@ class LoadCalamariFrakturModel:
 #
 # Architecture plan reference: plans/kraken_htr_architecture.md §4 / §Node 4
 
-def _swt_classify_single(pil_img, swt_threshold=0.3):
+def _swt_classify_single(pil_img, swt_threshold=0.35):
     """
     Approximate Stroke Width Transform using OpenCV distance transform.
 
-    Printed text has highly uniform stroke widths → low coefficient of variation (CV).
-    Handwritten text has variable stroke widths → high CV.
+    Printed text (Fraktur) has highly uniform stroke widths → low CV (~0.15–0.30).
+    Handwritten text (Kurrent) has variable stroke widths → high CV (~0.40–0.60).
+
+    Binarization: THRESH_BINARY_INV makes ink=255, background=0.
+    distanceTransform on this gives stroke half-widths at ink pixels.
+    dist[binary > 0] selects those half-width values for CV computation.
 
     Returns (label, cv_score) where label is 'printed' or 'handwritten'.
     """
     try:
         import cv2
         gray = np.array(pil_img.convert("L"))
+
+        # Ensure image has enough contrast for Otsu to work
+        if gray.std() < 5:
+            # Nearly uniform image — can't classify reliably, default handwritten
+            return "handwritten", 0.0
+
+        # THRESH_BINARY_INV + THRESH_OTSU: ink pixels → 255, background → 0
+        # This is correct for distanceTransform: non-zero = ink, zero = background
         _, binary = cv2.threshold(gray, 0, 255,
                                   cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        # distanceTransform: for each ink pixel (255), distance to nearest background (0)
+        # = stroke half-width at that pixel
         dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+
+        # Select distance values only at ink pixels
         ink_pixels = dist[binary > 0]
         if len(ink_pixels) < 10:
+            # Too few ink pixels — image may be blank or nearly blank
             return "handwritten", 0.0
+
         mean_sw = float(np.mean(ink_pixels))
         std_sw  = float(np.std(ink_pixels))
         cv = std_sw / (mean_sw + 1e-6)
+
+        # CV < threshold → uniform strokes → printed (Fraktur)
+        # CV >= threshold → variable strokes → handwritten (Kurrent)
+        # Default threshold 0.35: Fraktur CV ~0.15-0.30 → printed ✓
+        #                         Kurrent CV ~0.40-0.60 → handwritten ✓
         label = "printed" if cv < swt_threshold else "handwritten"
         return label, round(cv, 4)
     except ImportError:
@@ -888,20 +912,33 @@ class PrintedHandwrittenClassifierV2:
     Enhanced classifier for printed (Fraktur) vs. handwritten (Kurrent) line images.
 
     Methods:
-      - projection_variance: horizontal projection profile variance (fast, existing)
-      - stroke_width_transform: SWT via distance transform (more robust, recommended)
+      - stroke_width_transform: SWT via distance transform (recommended for Fraktur/Kurrent)
+        Threshold is CV (coefficient of variation of stroke widths).
+        Fraktur: CV ~0.15-0.30 → printed. Kurrent: CV ~0.40-0.60 → handwritten.
+        Default threshold 0.35 separates the two ranges cleanly.
+      - projection_variance: horizontal projection profile variance (fast, legacy)
       - combined: votes between both methods; SWT wins on disagreement
+
+    Inputs:
+      - images: IMAGE batch (line crops or word crops)
+      - method: classification method
+      - threshold: decision boundary (default 0.35 for SWT)
+      - override_mode: auto / force_printed / force_handwritten
+      - labels_json_override: if non-empty JSON string, skip classification entirely
+        and return this as labels_json (format: [{"idx":0,"label":"handwritten",...}])
 
     Returns:
       - labels_json: [{"index": 0, "label": "printed"|"handwritten",
                         "confidence": 0.85, "score": 0.23}, ...]
+      - debug_scores: JSON string with per-image CV scores for threshold tuning,
+                      e.g. [{"index": 0, "cv": 0.28, "label": "printed"}, ...]
       - summary: human-readable string e.g. "3 printed, 2 handwritten"
     """
 
     CATEGORY     = "Sütterlin HTR/Classification"
     FUNCTION     = "classify"
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("labels_json", "summary")
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("labels_json", "debug_scores", "summary")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -910,22 +947,72 @@ class PrintedHandwrittenClassifierV2:
                 "images": ("IMAGE",),
                 "method": (["stroke_width_transform", "projection_variance", "combined"],),
                 "threshold": ("FLOAT", {
-                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "SWT: CV threshold (lower = more printed). "
-                               "Projection: variance threshold (lower = more printed).",
+                    "default": 0.35, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": (
+                        "SWT: CV threshold — lower = stricter 'printed' requirement. "
+                        "Fraktur CV ~0.15-0.30, Kurrent CV ~0.40-0.60. "
+                        "Default 0.35 cleanly separates the two. "
+                        "Projection: variance threshold (lower = more printed)."
+                    ),
                 }),
             },
             "optional": {
-                "override_mode": (["auto", "force_printed", "force_handwritten"],
-                                  {"default": "auto"}),
+                "override_mode": (
+                    ["auto", "force_printed", "force_handwritten"],
+                    {"default": "auto"},
+                ),
+                "labels_json_override": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": (
+                        "If non-empty, skip classification entirely and use this JSON. "
+                        "Format: [{\"idx\":0,\"label\":\"handwritten\",\"confidence\":1.0}, ...]"
+                    ),
+                }),
             },
         }
 
     def classify(self, images: torch.Tensor, method: str, threshold: float,
-                 override_mode: str = "auto"):
+                 override_mode: str = "auto", labels_json_override: str = ""):
+
+        # ── labels_json_override: bypass classification entirely ──────────────
+        if labels_json_override and labels_json_override.strip():
+            try:
+                override_data = json.loads(labels_json_override.strip())
+                # Normalise field names: accept both "idx" and "index"
+                normalised = []
+                for item in override_data:
+                    idx = item.get("index", item.get("idx", len(normalised)))
+                    normalised.append({
+                        "index":      idx,
+                        "label":      item.get("label", "handwritten"),
+                        "confidence": round(float(item.get("confidence", 1.0)), 4),
+                        "score":      round(float(item.get("score", 0.0)), 4),
+                    })
+                n_p = sum(1 for x in normalised if x["label"] == "printed")
+                n_h = len(normalised) - n_p
+                summary = f"{n_p} printed, {n_h} handwritten (from override)"
+                debug_scores = json.dumps(
+                    [{"index": x["index"], "cv": x["score"], "label": x["label"]}
+                     for x in normalised],
+                    ensure_ascii=False,
+                )
+                _safe_print(
+                    f"[PrintedHandwrittenClassifierV2] Using labels_json_override: {summary}",
+                    flush=True,
+                )
+                return (json.dumps(normalised, ensure_ascii=False), debug_scores, summary)
+            except (json.JSONDecodeError, Exception) as e:
+                _safe_print(
+                    f"[PrintedHandwrittenClassifierV2] Could not parse labels_json_override: {e}; "
+                    "falling back to classification.",
+                    flush=True,
+                )
+
         pil_images = _tensor_to_pil_list(images)
         B = len(pil_images)
         results = []
+        debug_entries = []
         n_printed = 0
         n_handwritten = 0
 
@@ -942,14 +1029,15 @@ class PrintedHandwrittenClassifierV2:
                         # Reuse existing helper; threshold is variance threshold
                         label, score = _classify_single_line(pil_img, threshold)
                     else:  # combined
-                        swt_label, swt_score = _swt_classify_single(pil_img, 0.3)
+                        # Use the user's threshold for SWT; scale for projection variance
+                        swt_label, swt_score = _swt_classify_single(pil_img, threshold)
                         pv_label,  pv_score  = _classify_single_line(pil_img, 50.0)
                         if swt_label == pv_label:
                             label = swt_label
-                            # Confidence: how far from threshold
+                            # Normalised combined score
                             score = (swt_score + pv_score / 50.0) / 2.0
                         else:
-                            # Disagreement: trust SWT
+                            # Disagreement: trust SWT (more robust for historical scripts)
                             label = swt_label
                             score = swt_score
                 except Exception as e:
@@ -957,12 +1045,14 @@ class PrintedHandwrittenClassifierV2:
                                 flush=True)
                     label, score = "handwritten", 0.0
 
-            # Confidence: distance from decision boundary (0.5 = uncertain)
+            # Confidence: distance from decision boundary
             if label == "printed":
-                confidence = max(0.5, 1.0 - score)
+                confidence = max(0.5, 1.0 - score / max(threshold, 1e-6))
+                confidence = min(1.0, confidence)
                 n_printed += 1
             else:
-                confidence = max(0.5, score)
+                confidence = max(0.5, score / max(threshold * 2, 1e-6))
+                confidence = min(1.0, confidence)
                 n_handwritten += 1
 
             results.append({
@@ -971,10 +1061,24 @@ class PrintedHandwrittenClassifierV2:
                 "confidence": round(float(confidence), 4),
                 "score":      round(float(score), 4),
             })
+            debug_entries.append({
+                "index": i,
+                "cv":    round(float(score), 4),
+                "label": label,
+            })
 
-        labels_json = json.dumps(results, ensure_ascii=False)
+        labels_json  = json.dumps(results, ensure_ascii=False)
+        debug_scores = json.dumps(debug_entries, ensure_ascii=False)
         summary = f"{n_printed} printed, {n_handwritten} handwritten"
-        _safe_print(f"[PrintedHandwrittenClassifierV2] {summary} (method={method})",
-                    flush=True)
+        _safe_print(
+            f"[PrintedHandwrittenClassifierV2] {summary} (method={method}, threshold={threshold})",
+            flush=True,
+        )
+        _safe_print(
+            f"[PrintedHandwrittenClassifierV2] CV scores: "
+            + ", ".join(f"#{e['index']}={e['cv']}" for e in debug_entries[:8])
+            + ("..." if len(debug_entries) > 8 else ""),
+            flush=True,
+        )
 
-        return (labels_json, summary)
+        return (labels_json, debug_scores, summary)
