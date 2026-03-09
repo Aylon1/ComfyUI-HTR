@@ -836,3 +836,137 @@ class LoadCalamariFrakturModel:
         except Exception as e:
             print(f"[LoadCalamariFrakturModel] Error: {e}")
             return (checkpoints_dir,)
+
+
+# ── Node 6: PrintedHandwrittenClassifier (SWT-enhanced version) ──────────────
+#
+# This is an ENHANCED replacement for the existing PrintedHandwrittenClassifier
+# (Node 2 above). It adds stroke_width_transform and combined methods.
+# The existing node is kept for backward compatibility; this new class is
+# registered under a different key: "PrintedHandwrittenClassifierV2".
+#
+# Architecture plan reference: plans/kraken_htr_architecture.md §4 / §Node 4
+
+def _swt_classify_single(pil_img, swt_threshold=0.3):
+    """
+    Approximate Stroke Width Transform using OpenCV distance transform.
+
+    Printed text has highly uniform stroke widths → low coefficient of variation (CV).
+    Handwritten text has variable stroke widths → high CV.
+
+    Returns (label, cv_score) where label is 'printed' or 'handwritten'.
+    """
+    try:
+        import cv2
+        gray = np.array(pil_img.convert("L"))
+        _, binary = cv2.threshold(gray, 0, 255,
+                                  cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+        ink_pixels = dist[binary > 0]
+        if len(ink_pixels) < 10:
+            return "handwritten", 0.0
+        mean_sw = float(np.mean(ink_pixels))
+        std_sw  = float(np.std(ink_pixels))
+        cv = std_sw / (mean_sw + 1e-6)
+        label = "printed" if cv < swt_threshold else "handwritten"
+        return label, round(cv, 4)
+    except ImportError:
+        # cv2 not available — fall back to projection variance
+        return _classify_single_line(pil_img, threshold=50.0)
+
+
+class PrintedHandwrittenClassifierV2:
+    """
+    Enhanced classifier for printed (Fraktur) vs. handwritten (Kurrent) line images.
+
+    Methods:
+      - projection_variance: horizontal projection profile variance (fast, existing)
+      - stroke_width_transform: SWT via distance transform (more robust, recommended)
+      - combined: votes between both methods; SWT wins on disagreement
+
+    Returns:
+      - labels_json: [{"index": 0, "label": "printed"|"handwritten",
+                        "confidence": 0.85, "score": 0.23}, ...]
+      - summary: human-readable string e.g. "3 printed, 2 handwritten"
+    """
+
+    CATEGORY     = "Sütterlin HTR/Classification"
+    FUNCTION     = "classify"
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("labels_json", "summary")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "method": (["stroke_width_transform", "projection_variance", "combined"],),
+                "threshold": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "SWT: CV threshold (lower = more printed). "
+                               "Projection: variance threshold (lower = more printed).",
+                }),
+            },
+            "optional": {
+                "override_mode": (["auto", "force_printed", "force_handwritten"],
+                                  {"default": "auto"}),
+            },
+        }
+
+    def classify(self, images: torch.Tensor, method: str, threshold: float,
+                 override_mode: str = "auto"):
+        pil_images = _tensor_to_pil_list(images)
+        B = len(pil_images)
+        results = []
+        n_printed = 0
+        n_handwritten = 0
+
+        for i, pil_img in enumerate(pil_images):
+            if override_mode == "force_printed":
+                label, score = "printed", 0.0
+            elif override_mode == "force_handwritten":
+                label, score = "handwritten", 1.0
+            else:
+                try:
+                    if method == "stroke_width_transform":
+                        label, score = _swt_classify_single(pil_img, threshold)
+                    elif method == "projection_variance":
+                        # Reuse existing helper; threshold is variance threshold
+                        label, score = _classify_single_line(pil_img, threshold)
+                    else:  # combined
+                        swt_label, swt_score = _swt_classify_single(pil_img, 0.3)
+                        pv_label,  pv_score  = _classify_single_line(pil_img, 50.0)
+                        if swt_label == pv_label:
+                            label = swt_label
+                            # Confidence: how far from threshold
+                            score = (swt_score + pv_score / 50.0) / 2.0
+                        else:
+                            # Disagreement: trust SWT
+                            label = swt_label
+                            score = swt_score
+                except Exception as e:
+                    print(f"[PrintedHandwrittenClassifierV2] Error on line {i}: {e}",
+                          flush=True)
+                    label, score = "handwritten", 0.0
+
+            # Confidence: distance from decision boundary (0.5 = uncertain)
+            if label == "printed":
+                confidence = max(0.5, 1.0 - score)
+                n_printed += 1
+            else:
+                confidence = max(0.5, score)
+                n_handwritten += 1
+
+            results.append({
+                "index":      i,
+                "label":      label,
+                "confidence": round(float(confidence), 4),
+                "score":      round(float(score), 4),
+            })
+
+        labels_json = json.dumps(results, ensure_ascii=False)
+        summary = f"{n_printed} printed, {n_handwritten} handwritten"
+        print(f"[PrintedHandwrittenClassifierV2] {summary} (method={method})",
+              flush=True)
+
+        return (labels_json, summary)

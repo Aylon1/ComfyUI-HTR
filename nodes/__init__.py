@@ -115,19 +115,49 @@ try:
         MixedScriptRouter,
         MergeTranscriptions,
         LoadCalamariFrakturModel,
+        PrintedHandwrittenClassifierV2,
     )
     NODE_CLASS_MAPPINGS["CalamariFraktur"] = CalamariFrakturNode
     NODE_CLASS_MAPPINGS["PrintedHandwrittenClassifier"] = PrintedHandwrittenClassifier
     NODE_CLASS_MAPPINGS["MixedScriptRouter"] = MixedScriptRouter
     NODE_CLASS_MAPPINGS["MergeTranscriptions"] = MergeTranscriptions
     NODE_CLASS_MAPPINGS["LoadCalamariFrakturModel"] = LoadCalamariFrakturModel
+    NODE_CLASS_MAPPINGS["PrintedHandwrittenClassifierV2"] = PrintedHandwrittenClassifierV2
     NODE_DISPLAY_NAME_MAPPINGS["CalamariFraktur"] = "Calamari Fraktur OCR"
     NODE_DISPLAY_NAME_MAPPINGS["PrintedHandwrittenClassifier"] = "Printed/Handwritten Classifier"
     NODE_DISPLAY_NAME_MAPPINGS["MixedScriptRouter"] = "Mixed Script Router"
     NODE_DISPLAY_NAME_MAPPINGS["MergeTranscriptions"] = "Merge Transcriptions"
     NODE_DISPLAY_NAME_MAPPINGS["LoadCalamariFrakturModel"] = "Load Calamari Fraktur Model"
+    NODE_DISPLAY_NAME_MAPPINGS["PrintedHandwrittenClassifierV2"] = "Printed/Handwritten Classifier (SWT)"
 except Exception as e:
     logger.warning(f"Could not import calamari_nodes: {e}")
+
+try:
+    from .kraken_htr_nodes import (
+        KrakenHTRModelLoader,
+        KrakenHTRInference,
+        KrakenWordSegmentation,
+        MixedScriptRouter as KrakenMixedScriptRouter,
+    )
+    NODE_CLASS_MAPPINGS["KrakenHTRModelLoader"] = KrakenHTRModelLoader
+    NODE_CLASS_MAPPINGS["KrakenHTRInference"] = KrakenHTRInference
+    NODE_CLASS_MAPPINGS["KrakenWordSegmentation"] = KrakenWordSegmentation
+    NODE_CLASS_MAPPINGS["KrakenMixedScriptRouter"] = KrakenMixedScriptRouter
+    NODE_DISPLAY_NAME_MAPPINGS["KrakenHTRModelLoader"] = "Kraken HTR Model Loader"
+    NODE_DISPLAY_NAME_MAPPINGS["KrakenHTRInference"] = "Kraken HTR Inference"
+    NODE_DISPLAY_NAME_MAPPINGS["KrakenWordSegmentation"] = "Kraken Word Segmentation"
+    NODE_DISPLAY_NAME_MAPPINGS["KrakenMixedScriptRouter"] = "Mixed Script Router (Kraken)"
+except Exception as e:
+    logger.warning(f"Could not import kraken_htr_nodes: {e}")
+
+try:
+    from .pagexml_nodes import PageXMLExporter, PageXMLMerger
+    NODE_CLASS_MAPPINGS["PageXMLExporter"] = PageXMLExporter
+    NODE_CLASS_MAPPINGS["PageXMLMerger"] = PageXMLMerger
+    NODE_DISPLAY_NAME_MAPPINGS["PageXMLExporter"] = "Page XML Exporter"
+    NODE_DISPLAY_NAME_MAPPINGS["PageXMLMerger"] = "Page XML Merger"
+except Exception as e:
+    logger.warning(f"Could not import pagexml_nodes: {e}")
 
 try:
     from .training_nodes import (
