@@ -260,6 +260,11 @@ def main():
     # ── Step 1: Load image ────────────────────────────────────────────────────
     try:
         from PIL import Image
+        # Disable PIL decompression-bomb guard: the image is a trusted temp file
+        # created by KrakenWordHTRInference (stacked word crops), not user input.
+        # Without this, stacking many word crops (e.g. 747) easily exceeds the
+        # default 178 MP limit and raises a DecompressionBombError (exit code 2).
+        Image.MAX_IMAGE_PIXELS = None
         image = Image.open(args.image).convert("RGB")
         print(f"[kraken_htr_worker] Loaded image: {args.image} {image.size}",
               file=sys.stderr)
