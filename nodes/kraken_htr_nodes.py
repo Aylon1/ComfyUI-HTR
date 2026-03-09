@@ -19,6 +19,14 @@ import sys
 import tempfile
 import urllib.request
 
+
+def _safe_print(*args, **kwargs):
+    """Print that silently ignores OSError (broken pipe / ComfyUI logger flush error)."""
+    try:
+        print(*args, **kwargs)
+    except OSError:
+        pass
+
 import numpy as np
 import torch
 from PIL import Image
@@ -161,14 +169,14 @@ def _download_kraken_htr_model(model_key, models_base_dir, registry, force_redow
     target_path = os.path.join(target_dir, filename)
 
     if os.path.isfile(target_path) and not force_redownload:
-        print(f"[KrakenHTRModelLoader] Model already exists: {target_path}", flush=True)
+        _safe_print(f"[KrakenHTRModelLoader] Model already exists: {target_path}", flush=True)
         return target_path
 
     os.makedirs(target_dir, exist_ok=True)
     url = registry["download_url"]
     size_mb = registry.get("size_mb", "?")
-    print(f"[KrakenHTRModelLoader] Downloading {filename} (~{size_mb} MB) from:\n"
-          f"  {url}", flush=True)
+    _safe_print(f"[KrakenHTRModelLoader] Downloading {filename} (~{size_mb} MB) from:\n"
+                f"  {url}", flush=True)
 
     # Streaming download with progress
     try:
@@ -186,8 +194,8 @@ def _download_kraken_htr_model(model_key, models_base_dir, registry, force_redow
                     downloaded += len(chunk)
                     if total > 0:
                         pct = downloaded / total * 100
-                        print(f"[KrakenHTRModelLoader] {downloaded // (1024*1024)} MB / "
-                              f"{total // (1024*1024)} MB ({pct:.0f}%)", flush=True)
+                        _safe_print(f"[KrakenHTRModelLoader] {downloaded // (1024*1024)} MB / "
+                                    f"{total // (1024*1024)} MB ({pct:.0f}%)", flush=True)
     except Exception as e:
         # Clean up partial download
         if os.path.exists(target_path):
@@ -198,7 +206,7 @@ def _download_kraken_htr_model(model_key, models_base_dir, registry, force_redow
             f"Try downloading manually and placing at: {target_path}"
         )
 
-    print(f"[KrakenHTRModelLoader] Download complete → {target_path}", flush=True)
+    _safe_print(f"[KrakenHTRModelLoader] Download complete → {target_path}", flush=True)
     return target_path
 
 
@@ -264,7 +272,7 @@ class KrakenHTRModelLoader:
                 raise FileNotFoundError(
                     f"[KrakenHTRModelLoader] Custom model not found: {path}"
                 )
-            print(f"[KrakenHTRModelLoader] Using custom model: {path}", flush=True)
+            _safe_print(f"[KrakenHTRModelLoader] Using custom model: {path}", flush=True)
             return ({"path": path, "script": "custom", "cer": None,
                      "display": f"Custom: {os.path.basename(path)}"},)
 
@@ -281,8 +289,8 @@ class KrakenHTRModelLoader:
         if cache_key in _KRAKEN_HTR_MODEL_PATH_CACHE and not force_redownload:
             cached_path = _KRAKEN_HTR_MODEL_PATH_CACHE[cache_key]
             if os.path.isfile(cached_path):
-                print(f"[KrakenHTRModelLoader] Using cached path: {cached_path}",
-                      flush=True)
+                _safe_print(f"[KrakenHTRModelLoader] Using cached path: {cached_path}",
+                             flush=True)
                 return ({"path": cached_path,
                          "script": registry["script"],
                          "cer": registry.get("cer"),
@@ -360,8 +368,8 @@ class KrakenHTRInference:
             raise ValueError(f"[KrakenHTRInference] Could not parse bboxes JSON: {e}")
 
         if not line_data:
-            print("[KrakenHTRInference] No lines in bboxes — returning empty results",
-                  flush=True)
+            _safe_print("[KrakenHTRInference] No lines in bboxes — returning empty results",
+                        flush=True)
             return ("", "[]", "[]", "[]")
 
         # ── 3. Convert image tensor → PIL → temp PNG ──────────────────────────
@@ -398,9 +406,9 @@ class KrakenHTRInference:
             if not bidi_reordering:
                 cmd.append("--no_bidi")
 
-            print(f"[KrakenHTRInference] Running HTR on {len(line_data)} line(s) "
-                  f"with model: {os.path.basename(model_path)}", flush=True)
-            print(f"[KrakenHTRInference] Command: {' '.join(cmd)}", flush=True)
+            _safe_print(f"[KrakenHTRInference] Running HTR on {len(line_data)} line(s) "
+                        f"with model: {os.path.basename(model_path)}", flush=True)
+            _safe_print(f"[KrakenHTRInference] Command: {' '.join(cmd)}", flush=True)
 
             # ── 6. Run subprocess ─────────────────────────────────────────────
             try:
@@ -420,7 +428,7 @@ class KrakenHTRInference:
             # Forward stderr to ComfyUI console
             if proc.stderr:
                 for line in proc.stderr.strip().splitlines():
-                    print(f"  [kraken_htr_worker] {line}", flush=True)
+                    _safe_print(f"  [kraken_htr_worker] {line}", flush=True)
 
             if proc.returncode != 0:
                 raise RuntimeError(
@@ -454,11 +462,11 @@ class KrakenHTRInference:
             confidences_json = json.dumps(confidences)
             word_cuts_json   = json.dumps(word_cuts, ensure_ascii=False)
 
-            print(f"[KrakenHTRInference] Done: {len(results)} line(s) transcribed.",
-                  flush=True)
+            _safe_print(f"[KrakenHTRInference] Done: {len(results)} line(s) transcribed.",
+                        flush=True)
             if texts:
-                print(f"[KrakenHTRInference] First line: {repr(texts[0][:80])}",
-                      flush=True)
+                _safe_print(f"[KrakenHTRInference] First line: {repr(texts[0][:80])}",
+                             flush=True)
 
             return (transcription, lines_json, confidences_json, word_cuts_json)
 
@@ -576,7 +584,7 @@ class KrakenWordSegmentation:
         try:
             line_data = json.loads(bboxes) if bboxes.strip() else []
         except json.JSONDecodeError as e:
-            print(f"[KrakenWordSegmentation] Could not parse bboxes: {e}", flush=True)
+            _safe_print(f"[KrakenWordSegmentation] Could not parse bboxes: {e}", flush=True)
             line_data = []
 
         pil_images = _tensor2pil(image)
@@ -657,8 +665,8 @@ class KrakenWordSegmentation:
                 "words": words_info,
             })
 
-        print(f"[KrakenWordSegmentation] opencv_cc: {total_words} words from "
-              f"{len(line_data)} lines", flush=True)
+        _safe_print(f"[KrakenWordSegmentation] opencv_cc: {total_words} words from "
+                    f"{len(line_data)} lines", flush=True)
 
         if not all_word_images:
             return (_empty_image_tensor(), json.dumps(word_bboxes_output), 0)
@@ -675,13 +683,13 @@ class KrakenWordSegmentation:
         try:
             cuts_per_line = json.loads(word_cuts_json) if word_cuts_json.strip() else []
         except json.JSONDecodeError as e:
-            print(f"[KrakenWordSegmentation] Could not parse word_cuts_json: {e}; "
-                  "falling back to opencv_cc", flush=True)
+            _safe_print(f"[KrakenWordSegmentation] Could not parse word_cuts_json: {e}; "
+                        "falling back to opencv_cc", flush=True)
             return self._segment_opencv(pil_img, line_data, img_w, img_h, 8, 5)
 
         if not cuts_per_line:
-            print("[KrakenWordSegmentation] word_cuts_json is empty; "
-                  "falling back to opencv_cc", flush=True)
+            _safe_print("[KrakenWordSegmentation] word_cuts_json is empty; "
+                        "falling back to opencv_cc", flush=True)
             return self._segment_opencv(pil_img, line_data, img_w, img_h, 8, 5)
 
         all_word_images = []
@@ -721,8 +729,8 @@ class KrakenWordSegmentation:
                 "words": words_info,
             })
 
-        print(f"[KrakenWordSegmentation] kraken_cuts: {total_words} words from "
-              f"{len(line_data)} lines", flush=True)
+        _safe_print(f"[KrakenWordSegmentation] kraken_cuts: {total_words} words from "
+                    f"{len(line_data)} lines", flush=True)
 
         if not all_word_images:
             return (_empty_image_tensor(), json.dumps(word_bboxes_output), 0)
@@ -782,14 +790,14 @@ class MixedScriptRouter:
         try:
             labels = json.loads(labels_json) if labels_json.strip() else []
         except json.JSONDecodeError as e:
-            print(f"[MixedScriptRouter] Could not parse labels_json: {e}", flush=True)
+            _safe_print(f"[MixedScriptRouter] Could not parse labels_json: {e}", flush=True)
             labels = []
 
         # ── Parse bboxes ──────────────────────────────────────────────────────
         try:
             all_bboxes = json.loads(line_bboxes_json) if line_bboxes_json.strip() else []
         except json.JSONDecodeError as e:
-            print(f"[MixedScriptRouter] Could not parse line_bboxes_json: {e}", flush=True)
+            _safe_print(f"[MixedScriptRouter] Could not parse line_bboxes_json: {e}", flush=True)
             all_bboxes = []
 
         B = line_images.shape[0]
@@ -847,9 +855,9 @@ class MixedScriptRouter:
             "script_map":            routing,
         }
 
-        print(f"[MixedScriptRouter] {len(kurrent_indices)} kurrent (handwritten), "
-              f"{len(fraktur_indices)} fraktur (printed) from {B} total lines.",
-              flush=True)
+        _safe_print(f"[MixedScriptRouter] {len(kurrent_indices)} kurrent (handwritten), "
+                    f"{len(fraktur_indices)} fraktur (printed) from {B} total lines.",
+                    flush=True)
 
         return (
             kurrent_lines,

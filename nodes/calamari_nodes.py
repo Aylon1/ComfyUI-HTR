@@ -20,6 +20,14 @@ import subprocess
 import sys
 from io import BytesIO
 
+
+def _safe_print(*args, **kwargs):
+    """Print that silently ignores OSError (broken pipe / ComfyUI logger flush error)."""
+    try:
+        print(*args, **kwargs)
+    except OSError:
+        pass
+
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
@@ -128,7 +136,7 @@ def _run_calamari_subprocess(numpy_images, checkpoints_dir):
     so the transcription output is never silently empty.
     """
     python_exe = CALAMARI_ENV_PYTHON if os.path.exists(CALAMARI_ENV_PYTHON) else sys.executable
-    print(f"[CalamariFraktur] subprocess python: {python_exe}", flush=True)
+    _safe_print(f"[CalamariFraktur] subprocess python: {python_exe}", flush=True)
 
     images_b64 = []
     for img_np in numpy_images:
@@ -159,44 +167,44 @@ def _run_calamari_subprocess(numpy_images, checkpoints_dir):
         )
     except subprocess.TimeoutExpired:
         msg = "[Calamari error: subprocess timed out after 300 s]"
-        print(f"[CalamariFraktur] {msg}", flush=True)
+        _safe_print(f"[CalamariFraktur] {msg}", flush=True)
         return ([msg] * len(numpy_images), [0.0] * len(numpy_images))
     except Exception as e:
         msg = f"[Calamari error: subprocess launch failed: {e}]"
-        print(f"[CalamariFraktur] {msg}", flush=True)
+        _safe_print(f"[CalamariFraktur] {msg}", flush=True)
         return ([msg] * len(numpy_images), [0.0] * len(numpy_images))
 
     if proc.stderr:
         for line in proc.stderr.strip().splitlines():
-            print(f"  [calamari_worker] {line}", flush=True)
+            _safe_print(f"  [calamari_worker] {line}", flush=True)
 
     if proc.returncode != 0:
         msg = f"[Calamari error: worker exited with code {proc.returncode}]"
-        print(f"[CalamariFraktur] {msg}", flush=True)
+        _safe_print(f"[CalamariFraktur] {msg}", flush=True)
         return ([msg] * len(numpy_images), [0.0] * len(numpy_images))
 
     raw = proc.stdout.strip()
     if not raw:
         msg = "[Calamari error: worker produced no output]"
-        print(f"[CalamariFraktur] {msg}", flush=True)
+        _safe_print(f"[CalamariFraktur] {msg}", flush=True)
         return ([msg] * len(numpy_images), [0.0] * len(numpy_images))
 
     try:
         output = json.loads(raw)
     except json.JSONDecodeError as e:
         msg = f"[Calamari error: could not parse worker JSON: {e}]"
-        print(f"[CalamariFraktur] {msg}", flush=True)
+        _safe_print(f"[CalamariFraktur] {msg}", flush=True)
         return ([msg] * len(numpy_images), [0.0] * len(numpy_images))
 
     if "error" in output:
         worker_err = output["error"]
-        print(f"[CalamariFraktur] Worker error: {worker_err}", flush=True)
+        _safe_print(f"[CalamariFraktur] Worker error: {worker_err}", flush=True)
         msg = f"[Calamari error: {worker_err}]"
         return ([msg] * len(numpy_images), [0.0] * len(numpy_images))
 
     results     = output.get("results", [])
     confidences = output.get("confidences", [])
-    print(f"[CalamariFraktur] First 3 results: {results[:3]}", flush=True)
+    _safe_print(f"[CalamariFraktur] First 3 results: {results[:3]}", flush=True)
     return (results, confidences)
 
 
@@ -232,8 +240,8 @@ def _download_calamari_model(model_key, models_base_dir, registry):
         # ── Primary: git clone ────────────────────────────────────────────
         git_ok = False
         if not os.path.isdir(repo_dir):
-            print(f"[LoadCalamariFrakturModel] git clone --depth=1 "
-                  f"https://github.com/{repo}.git → {repo_dir}")
+            _safe_print(f"[LoadCalamariFrakturModel] git clone --depth=1 "
+                        f"https://github.com/{repo}.git → {repo_dir}")
             try:
                 result = subprocess.run(
                     ["git", "clone", "--depth=1",
@@ -242,19 +250,19 @@ def _download_calamari_model(model_key, models_base_dir, registry):
                 )
                 if result.returncode == 0:
                     git_ok = True
-                    print(f"[LoadCalamariFrakturModel] Clone succeeded.")
+                    _safe_print(f"[LoadCalamariFrakturModel] Clone succeeded.")
                 else:
-                    print(f"[LoadCalamariFrakturModel] git clone failed "
-                          f"(rc={result.returncode}): {result.stderr.strip()}")
+                    _safe_print(f"[LoadCalamariFrakturModel] git clone failed "
+                                f"(rc={result.returncode}): {result.stderr.strip()}")
             except FileNotFoundError:
-                print("[LoadCalamariFrakturModel] git not found on PATH.")
+                _safe_print("[LoadCalamariFrakturModel] git not found on PATH.")
             except subprocess.TimeoutExpired:
-                print("[LoadCalamariFrakturModel] git clone timed out after 600 s.")
+                _safe_print("[LoadCalamariFrakturModel] git clone timed out after 600 s.")
             except Exception as exc:
-                print(f"[LoadCalamariFrakturModel] git clone error: {exc}")
+                _safe_print(f"[LoadCalamariFrakturModel] git clone error: {exc}")
         else:
             git_ok = True
-            print(f"[LoadCalamariFrakturModel] Repo already cloned at {repo_dir}")
+            _safe_print(f"[LoadCalamariFrakturModel] Repo already cloned at {repo_dir}")
 
         if git_ok:
             src_dir = os.path.join(repo_dir, models_path)
@@ -264,13 +272,13 @@ def _download_calamari_model(model_key, models_base_dir, registry):
                     src = os.path.join(src_dir, fname)
                     dst = os.path.join(target_dir, fname)
                     if os.path.isfile(src) and not os.path.exists(dst):
-                        print(f"[LoadCalamariFrakturModel] Copying {fname}...")
+                        _safe_print(f"[LoadCalamariFrakturModel] Copying {fname}...")
                         shutil.copy2(src, dst)
                         copied += 1
                     elif os.path.isfile(src):
-                        print(f"[LoadCalamariFrakturModel] Already exists: {fname}")
-                print(f"[LoadCalamariFrakturModel] Copied {copied} new file(s) "
-                      f"from cloned repo.")
+                        _safe_print(f"[LoadCalamariFrakturModel] Already exists: {fname}")
+                _safe_print(f"[LoadCalamariFrakturModel] Copied {copied} new file(s) "
+                            f"from cloned repo.")
             else:
                 raise RuntimeError(
                     f"Expected model path not found in cloned repo: {src_dir}\n"
@@ -279,11 +287,11 @@ def _download_calamari_model(model_key, models_base_dir, registry):
         else:
             # ── Fallback: urllib via raw.githubusercontent.com ────────────
             # This only works for files ≤100 MB; requires knowing filenames.
-            print("[LoadCalamariFrakturModel] Falling back to urllib download "
-                  "(requires known filenames).")
+            _safe_print("[LoadCalamariFrakturModel] Falling back to urllib download "
+                        "(requires known filenames).")
             import json as json_mod
             api_url = (f"https://api.github.com/repos/{repo}/contents/{models_path}")
-            print(f"[LoadCalamariFrakturModel] Fetching file list from {api_url}")
+            _safe_print(f"[LoadCalamariFrakturModel] Fetching file list from {api_url}")
             try:
                 req = urllib.request.Request(
                     api_url, headers={"User-Agent": "ComfyUI-HTR"})
@@ -295,7 +303,7 @@ def _download_calamari_model(model_key, models_base_dir, registry):
                         fname = f["name"]
                         dest = os.path.join(target_dir, fname)
                         if not os.path.exists(dest):
-                            print(f"[LoadCalamariFrakturModel] Downloading {fname}...")
+                            _safe_print(f"[LoadCalamariFrakturModel] Downloading {fname}...")
                             urllib.request.urlretrieve(f["download_url"], dest)
                             downloaded += 1
                 if downloaded == 0 and not any(
@@ -317,9 +325,9 @@ def _download_calamari_model(model_key, models_base_dir, registry):
         url = registry["download_url"]
         fname = url.split("/")[-1]
         tmp_path = os.path.join(models_base_dir, fname)
-        print(f"[LoadCalamariFrakturModel] Downloading {fname}...")
+        _safe_print(f"[LoadCalamariFrakturModel] Downloading {fname}...")
         urllib.request.urlretrieve(url, tmp_path)
-        print(f"[LoadCalamariFrakturModel] Extracting {fname}...")
+        _safe_print(f"[LoadCalamariFrakturModel] Extracting {fname}...")
         # Auto-detect compression: .tar.gz or .tar.xz
         if fname.endswith(".tar.gz") or fname.endswith(".tgz"):
             mode = "r:gz"
@@ -333,7 +341,7 @@ def _download_calamari_model(model_key, models_base_dir, registry):
             tar.extractall(target_dir)
         os.remove(tmp_path)
 
-    print(f"[LoadCalamariFrakturModel] Download complete → {target_dir}")
+    _safe_print(f"[LoadCalamariFrakturModel] Download complete → {target_dir}")
 
 
 # ── Node 1: CalamariFrakturNode ───────────────────────────────────────────────
@@ -386,20 +394,20 @@ class CalamariFrakturNode:
                 # LoadCalamariFrakturModel returned a path string (subprocess fallback)
                 checkpoints_dir = calamari_model
                 predictor = None
-                print(f"[CalamariFraktur] calamari_model is a path string → subprocess mode: "
-                      f"{checkpoints_dir}", flush=True)
+                _safe_print(f"[CalamariFraktur] calamari_model is a path string → subprocess mode: "
+                             f"{checkpoints_dir}", flush=True)
             else:
                 # It's a live Predictor object — use it directly
                 predictor = calamari_model
                 checkpoints_dir = calamari_checkpoints_dir
-                print(f"[CalamariFraktur] Using pre-loaded predictor from LoadCalamariFrakturModel "
-                      f"({len(numpy_images)} line(s))", flush=True)
+                _safe_print(f"[CalamariFraktur] Using pre-loaded predictor from LoadCalamariFrakturModel "
+                             f"({len(numpy_images)} line(s))", flush=True)
         else:
             predictor = None
             checkpoints_dir = calamari_checkpoints_dir
 
-        print(f"[CalamariFraktur] Processing {len(numpy_images)} line(s) from "
-              f"{checkpoints_dir}", flush=True)
+        _safe_print(f"[CalamariFraktur] Processing {len(numpy_images)} line(s) from "
+                    f"{checkpoints_dir}", flush=True)
 
         # 2. Try in-process Calamari (pre-loaded predictor or load fresh)
         results = []
@@ -416,11 +424,11 @@ class CalamariFrakturNode:
                         float(getattr(result[0].outputs, "avg_char_probability", 0.0))
                     )
                 except Exception as e:
-                    print(f"[CalamariFraktur] Pre-loaded predictor inference error: {e}", flush=True)
+                    _safe_print(f"[CalamariFraktur] Pre-loaded predictor inference error: {e}", flush=True)
                     results.append("")
                     confidences.append(0.0)
-            print(f"[CalamariFraktur] Pre-loaded predictor returned {len(results)} result(s).",
-                  flush=True)
+            _safe_print(f"[CalamariFraktur] Pre-loaded predictor returned {len(results)} result(s).",
+                        flush=True)
         else:
             try:
                 from glob import glob
@@ -449,29 +457,29 @@ class CalamariFrakturNode:
                             float(getattr(result[0].outputs, "avg_char_probability", 0.0))
                         )
                     except Exception as e:
-                        print(f"[CalamariFraktur] In-process inference error: {e}", flush=True)
+                        _safe_print(f"[CalamariFraktur] In-process inference error: {e}", flush=True)
                         results.append("")
                         confidences.append(0.0)
-
+    
             except ImportError as e:
-                print(f"[CalamariFraktur] calamari_ocr not available in-process ({e}); "
-                      "falling back to subprocess.", flush=True)
+                _safe_print(f"[CalamariFraktur] calamari_ocr not available in-process ({e}); "
+                             "falling back to subprocess.", flush=True)
                 used_subprocess = True
                 results, confidences = _run_calamari_subprocess(numpy_images, checkpoints_dir)
 
             except Exception as e:
-                print(f"[CalamariFraktur] Unexpected error during in-process inference: {e}; "
-                      "falling back to subprocess.", flush=True)
+                _safe_print(f"[CalamariFraktur] Unexpected error during in-process inference: {e}; "
+                             "falling back to subprocess.", flush=True)
                 used_subprocess = True
                 results, confidences = _run_calamari_subprocess(numpy_images, checkpoints_dir)
-
+    
             if used_subprocess:
                 non_empty = sum(1 for r in results if r and not r.startswith("[Calamari error:"))
-                print(f"[CalamariFraktur] Subprocess returned {len(results)} result(s) "
-                      f"({non_empty} non-empty).", flush=True)
-                print(f"[CalamariFraktur] First 3 results: {results[:3]}", flush=True)
+                _safe_print(f"[CalamariFraktur] Subprocess returned {len(results)} result(s) "
+                             f"({non_empty} non-empty).", flush=True)
+                _safe_print(f"[CalamariFraktur] First 3 results: {results[:3]}", flush=True)
             else:
-                print(f"[CalamariFraktur] In-process returned {len(results)} result(s).", flush=True)
+                _safe_print(f"[CalamariFraktur] In-process returned {len(results)} result(s).", flush=True)
 
         # Pad to match input length if needed
         while len(results) < len(numpy_images):
@@ -550,8 +558,8 @@ class PrintedHandwrittenClassifier:
                 try:
                     label, variance = _classify_single_line(pil_img, variance_threshold)
                 except Exception as e:
-                    print(f"[PrintedHandwrittenClassifier] Error on line {i}: {e}", flush=True)
-                    label, variance = "handwritten", 0.0
+                        _safe_print(f"[PrintedHandwrittenClassifier] Error on line {i}: {e}", flush=True)
+                        label, variance = "handwritten", 0.0
 
             classifications.append({
                 "index": i,
@@ -567,8 +575,8 @@ class PrintedHandwrittenClassifier:
         debug_pil = self._build_debug_image(pil_images, classifications)
         debug_tensor = _pil_list_to_tensor([debug_pil])
 
-        print(f"[PrintedHandwrittenClassifier] {sum(mask)}/{B} lines classified as printed.",
-              flush=True)
+        _safe_print(f"[PrintedHandwrittenClassifier] {sum(mask)}/{B} lines classified as printed.",
+                    flush=True)
 
         return (classification_json, printed_mask_json, debug_tensor)
 
@@ -650,7 +658,7 @@ class MixedScriptRouter:
         try:
             mask = json.loads(printed_mask_json)
         except json.JSONDecodeError as e:
-            print(f"[MixedScriptRouter] Could not parse printed_mask_json: {e}", flush=True)
+            _safe_print(f"[MixedScriptRouter] Could not parse printed_mask_json: {e}", flush=True)
             mask = [False] * images.shape[0]
 
         B = images.shape[0]
@@ -680,8 +688,8 @@ class MixedScriptRouter:
             "total":               B,
         })
 
-        print(f"[MixedScriptRouter] {len(printed_indices)} printed, "
-              f"{len(handwritten_indices)} handwritten (total {B}).", flush=True)
+        _safe_print(f"[MixedScriptRouter] {len(printed_indices)} printed, "
+                    f"{len(handwritten_indices)} handwritten (total {B}).", flush=True)
 
         return (
             printed_lines,
@@ -726,7 +734,7 @@ class MergeTranscriptions:
         try:
             routing = json.loads(routing_json)
         except json.JSONDecodeError as e:
-            print(f"[MergeTranscriptions] Could not parse routing_json: {e}", flush=True)
+            _safe_print(f"[MergeTranscriptions] Could not parse routing_json: {e}", flush=True)
             routing = {"printed_indices": [], "handwritten_indices": [], "total": 0}
 
         printed_indices     = routing.get("printed_indices", [])
@@ -751,8 +759,8 @@ class MergeTranscriptions:
         merged_text       = "\n".join(merged)
         merged_lines_json = json.dumps(merged, ensure_ascii=False)
 
-        print(f"[MergeTranscriptions] Merged {len(printed_indices)} Calamari + "
-              f"{len(handwritten_indices)} TrOCR lines into {total} total.", flush=True)
+        _safe_print(f"[MergeTranscriptions] Merged {len(printed_indices)} Calamari + "
+                    f"{len(handwritten_indices)} TrOCR lines into {total} total.", flush=True)
 
         return (merged_text, merged_lines_json)
 
@@ -796,14 +804,14 @@ class LoadCalamariFrakturModel:
 
         # Step 1: Check cache
         if cache_key in _CALAMARI_MODEL_CACHE and not force_redownload:
-            print(f"[LoadCalamariFrakturModel] Using cached model")
+            _safe_print(f"[LoadCalamariFrakturModel] Using cached model")
             return (_CALAMARI_MODEL_CACHE[cache_key],)
 
         # Step 2: Download if needed
         from glob import glob
         existing = glob(os.path.join(checkpoints_dir, "*.ckpt.json"))
         if not existing or force_redownload:
-            print(f"[LoadCalamariFrakturModel] Downloading {model}...")
+            _safe_print(f"[LoadCalamariFrakturModel] Downloading {model}...")
             _download_calamari_model(model, models_base_dir, registry)
 
         # Step 3: Load model
@@ -818,23 +826,23 @@ class LoadCalamariFrakturModel:
             if not checkpoints:
                 raise FileNotFoundError(f"No .ckpt.json files in {checkpoints_dir}")
 
-            print(f"[LoadCalamariFrakturModel] Loading {len(checkpoints)} checkpoint(s)...")
+            _safe_print(f"[LoadCalamariFrakturModel] Loading {len(checkpoints)} checkpoint(s)...")
             params = PredictorParams()
             params.silent = True
             post_init(params)
             predictor = Predictor.from_checkpoint(params=params, checkpoint=checkpoints)
 
             _CALAMARI_MODEL_CACHE[cache_key] = predictor
-            print(f"[LoadCalamariFrakturModel] Model loaded and cached OK")
+            _safe_print(f"[LoadCalamariFrakturModel] Model loaded and cached OK")
             return (predictor,)
 
         except ImportError as e:
-            print(f"[LoadCalamariFrakturModel] calamari-ocr not installed ({e})")
-            print(f"[LoadCalamariFrakturModel] Returning path for subprocess fallback")
+            _safe_print(f"[LoadCalamariFrakturModel] calamari-ocr not installed ({e})")
+            _safe_print(f"[LoadCalamariFrakturModel] Returning path for subprocess fallback")
             _CALAMARI_MODEL_CACHE[cache_key] = checkpoints_dir
             return (checkpoints_dir,)
         except Exception as e:
-            print(f"[LoadCalamariFrakturModel] Error: {e}")
+            _safe_print(f"[LoadCalamariFrakturModel] Error: {e}")
             return (checkpoints_dir,)
 
 
@@ -945,8 +953,8 @@ class PrintedHandwrittenClassifierV2:
                             label = swt_label
                             score = swt_score
                 except Exception as e:
-                    print(f"[PrintedHandwrittenClassifierV2] Error on line {i}: {e}",
-                          flush=True)
+                    _safe_print(f"[PrintedHandwrittenClassifierV2] Error on line {i}: {e}",
+                                flush=True)
                     label, score = "handwritten", 0.0
 
             # Confidence: distance from decision boundary (0.5 = uncertain)
@@ -966,7 +974,7 @@ class PrintedHandwrittenClassifierV2:
 
         labels_json = json.dumps(results, ensure_ascii=False)
         summary = f"{n_printed} printed, {n_handwritten} handwritten"
-        print(f"[PrintedHandwrittenClassifierV2] {summary} (method={method})",
-              flush=True)
+        _safe_print(f"[PrintedHandwrittenClassifierV2] {summary} (method={method})",
+                    flush=True)
 
         return (labels_json, summary)

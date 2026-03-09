@@ -4,6 +4,14 @@ import numpy as np
 from PIL import Image
 from typing import Tuple, Dict, Any, List, Optional
 
+
+def _safe_print(*args, **kwargs):
+    """Print that silently ignores OSError (broken pipe / ComfyUI logger flush error)."""
+    try:
+        print(*args, **kwargs)
+    except OSError:
+        pass
+
 from ..utils.model_downloader import TrOCRModelDownloader
 from ..utils.model_cache import TrOCRModelCache
 
@@ -89,11 +97,11 @@ class LoadTrOCRModel:
     def load_model(self, model_name: str, device: str, dtype: str, auto_download: bool, model_path: str = ""):
         if not TrOCRModelDownloader.is_model_downloaded(model_name):
             if auto_download:
-                print(f"Model not found locally. Auto-downloading {model_name}...")
+                _safe_print(f"Model not found locally. Auto-downloading {model_name}...")
                 success, message, info = TrOCRModelDownloader.download_model(model_name)
                 if not success:
                     raise RuntimeError(f"Failed to download model: {message}")
-                print(message)
+                _safe_print(message)
             else:
                 raise FileNotFoundError(
                     f"Model {model_name} not found locally. "

@@ -12,6 +12,14 @@ import subprocess
 import sys
 import tempfile
 
+
+def _safe_print(*args, **kwargs):
+    """Print that silently ignores OSError (broken pipe / ComfyUI logger flush error)."""
+    try:
+        print(*args, **kwargs)
+    except OSError:
+        pass
+
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
@@ -116,8 +124,8 @@ def _ensure_kraken_env():
             "Please create it or run it manually before using this node."
         )
 
-    print("[KrakenLineSegmentation] kraken_env not found — running setup script...")
-    print(f"[KrakenLineSegmentation] This may take several minutes on first run.")
+    _safe_print("[KrakenLineSegmentation] kraken_env not found — running setup script...")
+    _safe_print(f"[KrakenLineSegmentation] This may take several minutes on first run.")
 
     try:
         result = subprocess.run(
@@ -143,8 +151,8 @@ def _ensure_kraken_env():
             f"(exit code {result.returncode}):\n{result.stderr}"
         )
 
-    print("[KrakenLineSegmentation] Setup complete.")
-    print(result.stdout)
+    _safe_print("[KrakenLineSegmentation] Setup complete.")
+    _safe_print(result.stdout)
 
 
 # ── Annotation helper ─────────────────────────────────────────────────────────
@@ -257,7 +265,7 @@ class KrakenLineSegmentation:
                 "--model",  model,
             ]
 
-            print(f"[KrakenLineSegmentation] Running: {' '.join(cmd)}", flush=True)
+            _safe_print(f"[KrakenLineSegmentation] Running: {' '.join(cmd)}", flush=True)
 
             # Build a clean environment: inherit OS vars but strip Python path
             # overrides so the kraken_env venv uses only its own site-packages.
@@ -283,7 +291,7 @@ class KrakenLineSegmentation:
             # Forward worker stderr to ComfyUI console for visibility
             if proc.stderr:
                 for line in proc.stderr.strip().splitlines():
-                    print(f"  {line}", flush=True)
+                    _safe_print(f"  {line}", flush=True)
 
             if proc.returncode != 0:
                 raise RuntimeError(
@@ -316,7 +324,7 @@ class KrakenLineSegmentation:
                 if w >= min_width and h >= min_height:
                     filtered.append(item)
 
-            print(
+            _safe_print(
                 f"[KrakenLineSegmentation] {len(results)} lines detected, "
                 f"{len(filtered)} kept after size filter.",
                 flush=True,

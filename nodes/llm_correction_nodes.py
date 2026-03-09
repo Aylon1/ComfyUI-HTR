@@ -20,6 +20,14 @@ from PIL import Image
 from typing import Dict, Any, List, Optional
 
 
+def _safe_print(*args, **kwargs):
+    """Print that silently ignores OSError (broken pipe / ComfyUI logger flush error)."""
+    try:
+        print(*args, **kwargs)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
@@ -302,19 +310,19 @@ class LLMHTRCorrection:
         api_key: str = "",
     ):
         # --- Parse hypotheses JSON ---
-        print(f"[LLMHTRCorrection] Received all_hypotheses_json type={type(all_hypotheses_json).__name__} "
-              f"len={len(all_hypotheses_json) if all_hypotheses_json else 0} "
-              f"preview={repr(all_hypotheses_json[:80]) if all_hypotheses_json else 'None'}")
+        _safe_print(f"[LLMHTRCorrection] Received all_hypotheses_json type={type(all_hypotheses_json).__name__} "
+                    f"len={len(all_hypotheses_json) if all_hypotheses_json else 0} "
+                    f"preview={repr(all_hypotheses_json[:80]) if all_hypotheses_json else 'None'}")
 
         if not all_hypotheses_json or all_hypotheses_json.strip() in ("", "[]"):
-            print("[LLMHTRCorrection] Warning: empty all_hypotheses_json — returning empty string.")
+            _safe_print("[LLMHTRCorrection] Warning: empty all_hypotheses_json — returning empty string.")
             return ("",)
 
         try:
             hypotheses_data = json.loads(all_hypotheses_json)
         except json.JSONDecodeError as e:
-            print(f"[LLMHTRCorrection] ERROR: Invalid JSON in all_hypotheses_json: {e}")
-            print(f"[LLMHTRCorrection] First 200 chars: {repr(all_hypotheses_json[:200])}")
+            _safe_print(f"[LLMHTRCorrection] ERROR: Invalid JSON in all_hypotheses_json: {e}")
+            _safe_print(f"[LLMHTRCorrection] First 200 chars: {repr(all_hypotheses_json[:200])}")
             # Fallback: return empty rather than crashing ComfyUI
             return ("",)
 
@@ -327,7 +335,7 @@ class LLMHTRCorrection:
             try:
                 image_b64 = _tensor_to_b64(image)
             except Exception as e:
-                print(f"[LLMHTRCorrection] Warning: could not encode image: {e}")
+                _safe_print(f"[LLMHTRCorrection] Warning: could not encode image: {e}")
 
         # --- Build prompt ---
         prompt = _build_prompt(hypotheses_data, context_hint)
@@ -363,20 +371,20 @@ class LLMHTRCorrection:
                 raise ValueError(f"Unknown llm_provider: {llm_provider!r}")
 
         except urllib.error.URLError as e:
-            print(f"[LLMHTRCorrection] Network error calling {llm_provider}: {e}")
+            _safe_print(f"[LLMHTRCorrection] Network error calling {llm_provider}: {e}")
             # Graceful fallback: return TTA winner text unchanged
             fallback = "\n".join(
                 item.get("winner", "") for item in hypotheses_data
             )
-            print("[LLMHTRCorrection] Falling back to TTA winners.")
+            _safe_print("[LLMHTRCorrection] Falling back to TTA winners.")
             return (fallback,)
 
         except Exception as e:
-            print(f"[LLMHTRCorrection] LLM call failed ({llm_provider}): {e}")
+            _safe_print(f"[LLMHTRCorrection] LLM call failed ({llm_provider}): {e}")
             fallback = "\n".join(
                 item.get("winner", "") for item in hypotheses_data
             )
-            print("[LLMHTRCorrection] Falling back to TTA winners.")
+            _safe_print("[LLMHTRCorrection] Falling back to TTA winners.")
             return (fallback,)
 
         # --- Align LLM output lines with input lines ---
@@ -390,14 +398,14 @@ class LLMHTRCorrection:
         # that end with ':' and contain no digit-dot prefix.
         _num_prefix = _re.compile(r'^\s*\d+[\.\)]\s*')
         while raw_lines and raw_lines[0].rstrip().endswith(':') and not _num_prefix.match(raw_lines[0]):
-            print(f"[LLMHTRCorrection] Stripping preamble line: {raw_lines[0]!r}")
+            _safe_print(f"[LLMHTRCorrection] Stripping preamble line: {raw_lines[0]!r}")
             raw_lines = raw_lines[1:]
 
         # Strip leading numbering "1. ", "2) ", etc. from each line
         llm_lines = [_num_prefix.sub('', l).strip() for l in raw_lines]
 
-        print(f"[LLMHTRCorrection] LLM returned {len(llm_lines)} non-blank lines "
-              f"for {len(hypotheses_data)} input lines.")
+        _safe_print(f"[LLMHTRCorrection] LLM returned {len(llm_lines)} non-blank lines "
+                    f"for {len(hypotheses_data)} input lines.")
         corrected_lines = []
         for i, item in enumerate(hypotheses_data):
             if i < len(llm_lines):
