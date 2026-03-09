@@ -729,5 +729,337 @@ Ready-to-import workflow JSON files are in the `examples/` directory:
 | `examples/kraken_workflow.json` | Simple Kraken → BatchTrOCRInference pipeline |
 | `examples/beginner_workflow.json` | Minimal beginner workflow |
 | `examples/modular_workflow.json` | Modular pipeline with all optional nodes |
+| `examples/kraken_htr_workflow.json` | Workflow H (Mixed-script Kraken HTR + PAGE-XML) |
 
 Import via ComfyUI menu: **Load** → select the `.json` file.
+
+---
+
+## Workflow H: Mixed-Script HTR with Kraken (Kurrent + Fraktur)
+
+> **Branch:** `kraken_htr` | **New in this branch:** 7 nodes
+
+This workflow handles documents where some lines are handwritten (Kurrent) and others are
+printed (Fraktur). It uses Kraken's native `.mlmodel` format for both scripts, classifies
+each line using the Stroke Width Transform, routes to the appropriate model, and exports
+PAGE-XML with per-line confidence scores and optional word-level bounding boxes.
+
+Unlike Workflow B (which uses Calamari for Fraktur), this workflow uses **Kraken for both
+scripts** — a single subprocess worker, a single model format, and a unified output
+structure. The result is a standards-compliant PAGE-XML file that can be imported into
+Transkribus, eScriptorium, or any PAGE-XML-aware tool.
+
+### Node Pipeline
+
+The workflow has five logical groups, matching `examples/kraken_htr_workflow.json`:
+
+```
+Group 1 — Load & Segment
+─────────────────────────
+[LoadImage]  (built-in ComfyUI)
+  Outputs:
+    - slot 0 "IMAGE" → [KrakenLineSegmentation] input "image"
+    - slot 0 "IMAGE" → [KrakenHTRInference (kurrent)] input "image"
+    - slot 0 "IMAGE" → [KrakenHTRInference (fraktur)] input "image"
+    - slot 0 "IMAGE" → [KrakenWordSegmentation] input "image"
+    - slot 0 "IMAGE" → [PageXMLMerger] input "image"
+    - slot 0 "IMAGE" → [PageXMLExporter] input "image"
+
+[KrakenLineSegmentation]
+  Settings:
+    - device: "auto"
+    - model: "default"   (Kraken bundled blla.mlmodel)
+    - padding: 4
+    - min_width: 20
+    - min_height: 10
+  Outputs:
+    - slot 0 "cropped_lines" IMAGE → [PrintedHandwrittenClassifierV2] input "images"
+    - slot 0 "cropped_lines" IMAGE → [KrakenMixedScriptRouter] input "line_images"
+    - slot 1 "bboxes" STRING → [KrakenMixedScriptRouter] input "line_bboxes_json"
+    - slot 1 "bboxes" STRING → [KrakenHTRInference (kurrent)] input "bboxes"
+    - slot 1 "bboxes" STRING → [KrakenHTRInference (fraktur)] input "bboxes"
+    - slot 1 "bboxes" STRING → [KrakenWordSegmentation] input "bboxes"
+    - slot 1 "bboxes" STRING → [PageXMLMerger] input "bboxes"
+    - slot 1 "bboxes" STRING → [PageXMLExporter] input "bboxes"
+    - slot 3 "annotated_image" IMAGE → [PreviewImage] input "images"
+
+Group 2 — Classify & Route
+───────────────────────────
+[PrintedHandwrittenClassifierV2]
+  Settings:
+    - method: "stroke_width_transform"
+    - threshold: 0.3   (CV < 0.3 → printed)
+    - override_mode: "auto"
+  Inputs:
+    - images ← [KrakenLineSegmentation] slot 0 "cropped_lines"
+  Outputs:
+    - slot 0 "labels_json" STRING → [KrakenMixedScriptRouter] input "labels_json"
+
+[KrakenMixedScriptRouter]
+  Inputs:
+    - line_images ← [KrakenLineSegmentation] slot 0 "cropped_lines"
+    - line_bboxes_json ← [KrakenLineSegmentation] slot 1 "bboxes"
+    - labels_json ← [PrintedHandwrittenClassifierV2] slot 0 "labels_json"
+  Outputs:
+    - slot 0 "kurrent_lines" IMAGE → [KrakenHTRInference (kurrent)] input "image"
+      NOTE: KrakenHTRInference takes the FULL document image, not the sub-batch.
+            The kurrent_lines output is not used directly — the full image is passed
+            to both inference nodes; routing is handled via bboxes sub-lists.
+    - slot 1 "fraktur_lines" IMAGE → [KrakenHTRInference (fraktur)] input "image"
+      (same note as above)
+    - slot 4 "routing_json" STRING → [PageXMLMerger] input "routing_json"
+
+Group 3 — Load HTR Models
+──────────────────────────
+[KrakenHTRModelLoader]  ← KURRENT model
+  Settings:
+    - model: "ub_mannheim_kurrent_2023"
+    - models_base_dir: (default: ComfyUI/models/kraken_htr/)
+    - custom_model_path: ""
+    - force_redownload: False
+  Outputs:
+    - slot 0 "kraken_htr_model" KRAKEN_HTR_MODEL → [KrakenHTRInference (kurrent)] input "kraken_htr_model"
+
+[KrakenHTRModelLoader]  ← FRAKTUR model
+  Settings:
+    - model: "ub_mannheim_fraktur_2023"
+    - models_base_dir: (default: ComfyUI/models/kraken_htr/)
+    - custom_model_path: ""
+    - force_redownload: False
+  Outputs:
+    - slot 0 "kraken_htr_model" KRAKEN_HTR_MODEL → [KrakenHTRInference (fraktur)] input "kraken_htr_model"
+
+Group 4 — HTR Inference
+─────────────────────────
+[KrakenHTRInference]  ← KURRENT branch
+  Settings:
+    - device: "auto"
+    - pad: 16
+    - bidi_reordering: True
+  Inputs:
+    - image ← [LoadImage] slot 0 "IMAGE"   (FULL document image)
+    - bboxes ← [KrakenLineSegmentation] slot 1 "bboxes"
+      NOTE: Pass ALL bboxes here; the worker processes only the lines it receives.
+            To restrict to kurrent lines only, wire kurrent_bboxes_json (slot 2)
+            from KrakenMixedScriptRouter instead.
+    - kraken_htr_model ← [KrakenHTRModelLoader (kurrent)] slot 0 "kraken_htr_model"
+  Outputs:
+    - slot 0 "transcription" STRING → [PageXMLExporter] input "transcription"
+    - slot 1 "lines_json" STRING → [PageXMLMerger] input "handwritten_lines_json"
+    - slot 3 "word_cuts_json" STRING → [KrakenWordSegmentation] input "word_cuts_json"
+
+[KrakenHTRInference]  ← FRAKTUR branch
+  Settings:
+    - device: "auto"
+    - pad: 16
+    - bidi_reordering: True
+  Inputs:
+    - image ← [LoadImage] slot 0 "IMAGE"   (FULL document image)
+    - bboxes ← [KrakenLineSegmentation] slot 1 "bboxes"
+    - kraken_htr_model ← [KrakenHTRModelLoader (fraktur)] slot 0 "kraken_htr_model"
+  Outputs:
+    - slot 1 "lines_json" STRING → [PageXMLMerger] input "printed_lines_json"
+
+Group 5 — Word Segmentation + PAGE-XML Output
+───────────────────────────────────────────────
+[KrakenWordSegmentation]
+  Settings:
+    - mode: "kraken_cuts"   (uses character cuts from KrakenHTRInference)
+    - min_gap_px: 8
+    - min_word_width: 5
+  Inputs:
+    - image ← [LoadImage] slot 0 "IMAGE"
+    - bboxes ← [KrakenLineSegmentation] slot 1 "bboxes"
+    - word_cuts_json ← [KrakenHTRInference (kurrent)] slot 3 "word_cuts_json"
+  Outputs:
+    - slot 1 "word_bboxes_json" STRING → [PageXMLExporter] input "word_bboxes_json"
+
+[PageXMLExporter]   ← Kurrent-only PAGE-XML (with word elements)
+  Settings:
+    - output_path: "output/kurrent_page.xml"
+    - image_filename: "document.jpg"
+    - creator: "tjk_suetterlin"
+    - include_confidence: True
+  Inputs:
+    - image ← [LoadImage] slot 0 "IMAGE"
+    - bboxes ← [KrakenLineSegmentation] slot 1 "bboxes"
+    - transcription ← [KrakenHTRInference (kurrent)] slot 0 "transcription"
+    - lines_json ← [KrakenHTRInference (kurrent)] slot 1 "lines_json"
+    - word_bboxes_json ← [KrakenWordSegmentation] slot 1 "word_bboxes_json"
+  Outputs:
+    - slot 0 "xml_string" STRING   (complete PAGE-XML as string)
+    - slot 1 "output_path" STRING  (absolute path to saved file)
+
+[PageXMLMerger]   ← Mixed-script merged PAGE-XML
+  Settings:
+    - output_path: "output/merged.xml"
+    - image_filename: "document.jpg"
+    - creator: "tjk_suetterlin"
+  Inputs:
+    - image ← [LoadImage] slot 0 "IMAGE"
+    - bboxes ← [KrakenLineSegmentation] slot 1 "bboxes"
+    - routing_json ← [KrakenMixedScriptRouter] slot 4 "routing_json"
+    - handwritten_lines_json ← [KrakenHTRInference (kurrent)] slot 1 "lines_json"
+    - printed_lines_json ← [KrakenHTRInference (fraktur)] slot 1 "lines_json"
+  Outputs:
+    - slot 0 "xml_string" STRING
+    - slot 1 "merged_text" STRING → [TextOutput] input "text"
+    - slot 2 "output_path" STRING
+
+[TextOutput]
+  Inputs:
+    - text ← [PageXMLMerger] slot 1 "merged_text"
+
+[PreviewImage]  (built-in ComfyUI)
+  Inputs:
+    - images ← [KrakenLineSegmentation] slot 3 "annotated_image"
+```
+
+### New Nodes Reference
+
+All 7 nodes added in the `kraken_htr` branch:
+
+| ComfyUI Node Name | Category | Inputs | Outputs | Description |
+|---|---|---|---|---|
+| `KrakenHTRModelLoader` | Sütterlin HTR/Kraken | `model` (dropdown), `models_base_dir` STRING; optional: `custom_model_path` STRING, `force_redownload` BOOLEAN | 0:`kraken_htr_model` KRAKEN_HTR_MODEL | Downloads `.mlmodel` from Zenodo on first use; returns a path dict. Model is NOT loaded into memory — loading happens inside the subprocess. |
+| `KrakenHTRInference` | Sütterlin HTR/Kraken | `image` IMAGE, `bboxes` STRING, `kraken_htr_model` KRAKEN_HTR_MODEL; optional: `device` ["auto","cpu","cuda"] default "auto", `pad` INT default 16, `bidi_reordering` BOOLEAN default True | 0:`transcription` STRING, 1:`lines_json` STRING, 2:`confidences_json` STRING, 3:`word_cuts_json` STRING | Runs Kraken `rpred()` inside `kraken_env` subprocess. Takes the FULL document image + all line bboxes. Returns per-line text, confidence, and character-level word cuts. |
+| `KrakenWordSegmentation` | Sütterlin HTR/Kraken | `image` IMAGE, `bboxes` STRING; optional: `mode` ["opencv_cc","kraken_cuts"] default "opencv_cc", `word_cuts_json` STRING, `min_gap_px` INT default 8, `min_word_width` INT default 5 | 0:`word_images` IMAGE, 1:`word_bboxes_json` STRING, 2:`word_count` INT | Extracts word-level bounding boxes. `opencv_cc` uses OpenCV connected components (no HTR needed); `kraken_cuts` uses character cuts from `KrakenHTRInference` (more accurate). |
+| `KrakenMixedScriptRouter` | Sütterlin HTR/Kraken | `line_images` IMAGE, `line_bboxes_json` STRING, `labels_json` STRING | 0:`kurrent_lines` IMAGE, 1:`fraktur_lines` IMAGE, 2:`kurrent_bboxes_json` STRING, 3:`fraktur_bboxes_json` STRING, 4:`routing_json` STRING | Splits line batch by script type using `labels_json` from `PrintedHandwrittenClassifierV2`. Outputs white 1×64×64×3 placeholder when one sub-batch is empty. `routing_json` is compatible with both `PageXMLMerger` and `MergeTranscriptions`. |
+| `PageXMLExporter` | Sütterlin HTR/Output | `image` IMAGE, `bboxes` STRING, `transcription` STRING, `output_path` STRING; optional: `lines_json` STRING, `word_bboxes_json` STRING, `image_filename` STRING, `creator` STRING, `include_confidence` BOOLEAN default True | 0:`xml_string` STRING, 1:`output_path` STRING | Generates a valid PAGE-XML document. Uses polygon coordinates from `bboxes` when available; falls back to rectangular bbox. Adds `<Word>` elements when `word_bboxes_json` is connected. Always saves to disk (`OUTPUT_NODE=True`). |
+| `PageXMLMerger` | Sütterlin HTR/Output | `image` IMAGE, `bboxes` STRING, `routing_json` STRING, `handwritten_lines_json` STRING, `printed_lines_json` STRING, `output_path` STRING; optional: `image_filename` STRING, `creator` STRING | 0:`xml_string` STRING, 1:`merged_text` STRING, 2:`output_path` STRING | Merges kurrent + fraktur HTR results into a single PAGE-XML, restoring original document line order using `routing_json`. Each `<TextLine>` carries a `custom="model:kurrent_htr"` or `custom="model:fraktur_htr"` attribute. Always saves to disk (`OUTPUT_NODE=True`). |
+| `PrintedHandwrittenClassifierV2` | Sütterlin HTR/Classification | `images` IMAGE, `method` ["stroke_width_transform","projection_variance","combined"], `threshold` FLOAT default 0.5; optional: `override_mode` ["auto","force_printed","force_handwritten"] | 0:`labels_json` STRING, 1:`summary` STRING | Enhanced classifier. `labels_json` format: `[{"index": 0, "label": "printed", "confidence": 0.87, "score": 0.23}, ...]`. Compatible with `KrakenMixedScriptRouter`. |
+
+### Model Registry (KrakenHTRModelLoader)
+
+Models are downloaded from Zenodo on first use and cached in `ComfyUI/models/kraken_htr/`.
+
+| Registry Key | Display Name | Script | CER | Zenodo Record | Size |
+|---|---|---|---|---|---|
+| `ub_mannheim_kurrent_2023` | UB Mannheim German Kurrent 2023 | Kurrent (handwritten) | ~3.5% | [7933463](https://zenodo.org/records/7933463) | ~45 MB |
+| `ub_mannheim_kurrent_2022` | UB Mannheim German Kurrent 2022 | Kurrent (handwritten) | ~5.2% | [6657809](https://zenodo.org/records/6657809) | ~42 MB |
+| `ub_mannheim_fraktur_2023` | UB Mannheim German Fraktur Print 2023 | Fraktur (printed) | ~1.8% | [6657809](https://zenodo.org/records/6657809) | ~48 MB |
+| `custom` | Custom model (provide path below) | — | — | — | — |
+
+**Recommendation:** Use `ub_mannheim_kurrent_2023` for handwritten lines and
+`ub_mannheim_fraktur_2023` for printed lines. The 2022 Kurrent model is provided as a
+fallback if the 2023 model underperforms on your specific document collection.
+
+To use a local `.mlmodel` file not in the registry, select `custom` from the dropdown
+and provide the absolute path in the `custom_model_path` optional input.
+
+### PrintedHandwrittenClassifierV2 Methods
+
+| Method | Algorithm | Threshold meaning | When to use |
+|---|---|---|---|
+| `stroke_width_transform` | OpenCV distance transform on binarized line; computes coefficient of variation (CV = std/mean) of stroke widths across all ink pixels. Printed text has uniform stroke widths → low CV. | CV < threshold → printed. Default 0.3. Lower = stricter printed classification. | **Recommended default.** More robust than projection variance on documents with irregular line spacing or mixed-height characters. Requires `cv2` (OpenCV); falls back to projection variance if unavailable. |
+| `projection_variance` | Horizontal projection profile: count dark pixels per row → compute variance of the row-sum array. Printed text has regular character heights → low variance. | variance < threshold → printed. Default 50.0 (note: different scale from SWT). | Fast, no OpenCV required. Use when `cv2` is not installed or when documents have very clean, regular Fraktur printing. |
+| `combined` | Runs both SWT (threshold=0.3) and projection variance (threshold=50.0). If both agree, uses that label. If they disagree, **SWT wins**. | Both thresholds are fixed internally; the `threshold` parameter is ignored in combined mode. | Use when you want maximum robustness and don't mind the extra computation. Particularly useful for documents with ambiguous lines (e.g. partially printed, partially handwritten). |
+
+**Output format** (`labels_json`):
+```json
+[
+  {"index": 0, "label": "printed",     "confidence": 0.87, "score": 0.13},
+  {"index": 1, "label": "handwritten", "confidence": 0.92, "score": 0.78},
+  {"index": 2, "label": "printed",     "confidence": 0.95, "score": 0.05}
+]
+```
+- `score`: raw classifier score (CV for SWT, normalised variance for projection)
+- `confidence`: distance from decision boundary; always ≥ 0.5
+
+This format is consumed directly by `KrakenMixedScriptRouter` (`labels_json` input).
+
+### PageXML Output Format
+
+`PageXMLExporter` and `PageXMLMerger` produce PAGE-XML conforming to the
+[2019-07-15 schema](http://schema.primaresearch.org/PAGE/gts/pagecontent/2019-07-15).
+The output uses Python stdlib `xml.etree.ElementTree` — no additional dependency.
+
+**Element hierarchy:**
+
+```xml
+<?xml version='1.0' encoding='utf-8'?>
+<PcGts xmlns="http://schema.primaresearch.org/PAGE/gts/pagecontent/2019-07-15"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="...">
+  <Metadata>
+    <Creator>tjk_suetterlin</Creator>
+    <Created>2026-03-09T16:00:00</Created>
+    <LastChange>2026-03-09T16:00:00</LastChange>
+  </Metadata>
+  <Page imageFilename="document.jpg" imageWidth="2480" imageHeight="3508">
+    <TextRegion id="region_0" type="paragraph">
+      <Coords points="45,120 2435,120 2435,3388 45,3388"/>
+      <TextLine id="line_0" custom="model:kurrent_htr">
+        <Coords points="45,120 2435,120 2435,195 45,195"/>  <!-- polygon if available -->
+        <Baseline points="45,185 2435,185"/>                 <!-- if available -->
+        <Word id="word_0_0">
+          <Coords points="45,122 110,122 110,193 45,193"/>
+          <TextEquiv><Unicode>Im</Unicode></TextEquiv>
+        </Word>
+        <Word id="word_0_1">
+          <Coords points="120,122 250,122 250,193 120,193"/>
+          <TextEquiv><Unicode>Jahre</Unicode></TextEquiv>
+        </Word>
+        <TextEquiv conf="0.9230">
+          <Unicode>Im Jahre des Herrn</Unicode>
+        </TextEquiv>
+      </TextLine>
+      <TextLine id="line_1" custom="model:fraktur_htr">
+        ...
+      </TextLine>
+    </TextRegion>
+  </Page>
+</PcGts>
+```
+
+**Key details:**
+- **Coords:** Uses polygon points from Kraken's BLLA segmentation when available (more
+  accurate than rectangular bboxes for curved or tilted lines). Falls back to rectangular
+  `x1,y1 x2,y1 x2,y2 x1,y2` when polygon is absent.
+- **Baseline:** Included when `bboxes` JSON contains `"baseline"` data from
+  `KrakenLineSegmentation`.
+- **Word elements:** Added when `word_bboxes_json` from `KrakenWordSegmentation` is
+  connected. Each `<Word>` carries its own `<TextEquiv>` with the word text (from
+  `kraken_cuts` mode) or no text (from `opencv_cc` mode).
+- **Confidence:** `conf` attribute on `<TextEquiv>` is the per-character average
+  confidence from Kraken's `rpred()`. Omitted when `include_confidence=False`.
+- **Model attribution:** `PageXMLMerger` sets `custom="model:kurrent_htr"` or
+  `custom="model:fraktur_htr"` on each `<TextLine>` so downstream tools can identify
+  which model produced each line.
+- **TextRegion:** A single `region_0` of type `paragraph` spans the bounding box of all
+  detected lines. For documents with multiple text columns, post-process the XML to split
+  into multiple regions.
+
+### Tips for Mixed-Script Documents
+
+1. **Use `kraken_cuts` mode for word segmentation on Kurrent lines.** The OpenCV
+   connected-component mode (`opencv_cc`) works well for printed Fraktur but struggles
+   with Kurrent's connected cursive strokes. `kraken_cuts` uses the character-level
+   segmentation from `rpred()` itself, which is aware of the model's internal character
+   boundaries. Connect `word_cuts_json` from `KrakenHTRInference` to enable it.
+
+2. **Tune the SWT threshold per document collection, not per document.** The default
+   threshold of 0.3 works well for clean 300 DPI scans. For lower-quality scans or
+   documents with heavy ink bleed, lower the threshold to 0.2. For documents with very
+   irregular handwriting that looks "printed" (e.g. block-letter annotations), raise it
+   to 0.4. Once you find a good value for your collection, it should be stable across
+   documents from the same archive.
+
+3. **Pass the full document image to `KrakenHTRInference`, not line crops.** Unlike
+   TrOCR (which takes pre-cropped line images), Kraken's `rpred()` requires the full
+   document image plus polygon coordinates. The worker crops each line internally using
+   the polygon boundary. Passing pre-cropped images will produce incorrect results
+   because the polygon coordinates will be out of bounds.
+
+4. **Use `PageXMLMerger` for mixed-script output, `PageXMLExporter` for single-script.**
+   `PageXMLExporter` is simpler and supports word-level elements; use it when all lines
+   are the same script type. `PageXMLMerger` handles the routing logic to reconstruct
+   document order from two separate HTR streams; use it for the full mixed-script
+   pipeline. Both nodes always save to disk (`OUTPUT_NODE=True`).
+
+5. **First run downloads models automatically.** `KrakenHTRModelLoader` downloads
+   `.mlmodel` files from Zenodo on first use (~45–48 MB each). The download uses
+   streaming with 1 MB chunks and shows progress in the ComfyUI console. If the download
+   fails (network timeout, Zenodo unavailable), the partial file is deleted and an error
+   is raised with the direct URL so you can download manually and place the file at the
+   expected path.

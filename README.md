@@ -29,8 +29,9 @@ A comprehensive ComfyUI custom node package for Handwritten Text Recognition (HT
 10. [Training Your Own Models](#10-training-your-own-models)
 11. [Performance and GPU Usage](#11-performance-and-gpu-usage)
 12. [Troubleshooting](#12-troubleshooting)
-13. [File Structure](#13-file-structure)
-14. [References and Credits](#14-references-and-credits)
+13. [Kraken HTR Branch — 7 New Nodes](#13-kraken-htr-branch--7-new-nodes)
+14. [File Structure](#14-file-structure)
+15. [References and Credits](#15-references-and-credits)
 
 ---
 
@@ -557,14 +558,57 @@ Calamari uses TensorFlow in an isolated subprocess. TensorFlow must initialize C
 
 ---
 
-## 13. File Structure
+## 13. Kraken HTR Branch — 7 New Nodes
+
+> **Branch:** `kraken_htr`
+
+This branch adds a complete Kraken-native HTR pipeline that uses `.mlmodel` files for
+both Kurrent and Fraktur, classifies lines with the Stroke Width Transform, and exports
+standards-compliant PAGE-XML output.
+
+### New Nodes
+
+| Node | Category | Purpose |
+|------|----------|---------|
+| `KrakenHTRModelLoader` | Sütterlin HTR/Kraken | Downloads `.mlmodel` from Zenodo; returns path dict (model loaded in subprocess only) |
+| `KrakenHTRInference` | Sütterlin HTR/Kraken | Runs Kraken `rpred()` via `kraken_htr_worker` subprocess; takes full image + bboxes JSON |
+| `KrakenWordSegmentation` | Sütterlin HTR/Kraken | Word-level bbox extraction: OpenCV CC mode or Kraken character-cuts mode |
+| `KrakenMixedScriptRouter` | Sütterlin HTR/Kraken | Routes lines to kurrent/fraktur sub-batches; outputs bbox sub-lists + routing JSON |
+| `PageXMLExporter` | Sütterlin HTR/Output | Generates PAGE-XML from bboxes + transcription; optional word elements; saves to disk |
+| `PageXMLMerger` | Sütterlin HTR/Output | Merges kurrent + fraktur HTR results into single PAGE-XML in document order |
+| `PrintedHandwrittenClassifierV2` | Sütterlin HTR/Classification | SWT classifier (3 methods: `stroke_width_transform`, `projection_variance`, `combined`) |
+
+### Quick Start
+
+Import `examples/kraken_htr_workflow.json` for a ready-to-use mixed-script pipeline:
+
+```
+[LoadImage] → [KrakenLineSegmentation] → [PrintedHandwrittenClassifierV2]
+                    ↓                              ↓
+             [KrakenMixedScriptRouter] ←───────────┘
+               ↙ kurrent              fraktur ↘
+[KrakenHTRModelLoader]           [KrakenHTRModelLoader]
+[KrakenHTRInference]             [KrakenHTRInference]
+               ↘ lines_json      lines_json ↙
+              [PageXMLMerger] → merged.xml + [TextOutput]
+```
+
+See [`docs/WORKFLOWS.md` — Workflow H](docs/WORKFLOWS.md) for the full connection map
+and [`docs/ARCHITECTURE.md` — Kraken HTR Branch](docs/ARCHITECTURE.md) for
+implementation details.
+
+---
+
+## 14. File Structure
 
 ```
 tjk_suetterlin/
 ├── nodes/
-│   ├── __init__.py              # Node registration (all 27 nodes)
-│   ├── calamari_nodes.py        # Calamari OCR + mixed script routing (5 nodes)
+│   ├── __init__.py              # Node registration (all 34 nodes)
+│   ├── calamari_nodes.py        # Calamari OCR + mixed script routing + ClassifierV2 (6 nodes)
 │   ├── kraken_nodes.py          # Kraken BLLA line segmentation (1 node)
+│   ├── kraken_htr_nodes.py      # Kraken HTR inference + word seg + router (4 nodes) [kraken_htr]
+│   ├── pagexml_nodes.py         # PAGE-XML export + merge (2 nodes) [kraken_htr]
 │   ├── trocr_nodes.py           # TrOCR model loading + inference (6 nodes)
 │   ├── tta_nodes.py             # TTA ensemble (1 node)
 │   ├── llm_correction_nodes.py  # LLM post-correction (1 node)
@@ -579,7 +623,8 @@ tjk_suetterlin/
 ├── utils/
 │   ├── __init__.py
 │   ├── calamari_worker.py       # Calamari subprocess worker (JSON IPC)
-│   ├── kraken_worker.py         # Kraken subprocess worker (JSON IPC)
+│   ├── kraken_worker.py         # Kraken BLLA segmentation worker (JSON IPC)
+│   ├── kraken_htr_worker.py     # Kraken HTR inference worker (JSON IPC) [kraken_htr]
 │   ├── model_cache.py           # TrOCR model caching (TrOCRModelCache)
 │   ├── model_downloader.py      # HuggingFace model downloader + tokenizer fix
 │   ├── bbox_utils.py            # Bounding box utilities
@@ -590,6 +635,7 @@ tjk_suetterlin/
 │   └── ARCHITECTURE.md          # Technical deep-dive (subprocess isolation, etc.)
 ├── examples/
 │   ├── kraken_workflow.json     # Basic Kraken + BatchTrOCRInference workflow
+│   ├── kraken_htr_workflow.json # Mixed-script Kraken HTR + PAGE-XML [kraken_htr]
 │   ├── tta_workflow.json        # TTA ensemble workflow (Kurrent-only)
 │   ├── tta_llm_workflow.json    # Full pipeline with LLM correction
 │   ├── beginner_workflow.json   # Minimal beginner workflow
@@ -601,7 +647,7 @@ tjk_suetterlin/
 
 ---
 
-## 14. References and Credits
+## 15. References and Credits
 
 - **Kraken:** https://kraken.re — Benjamin Kiessling, École Pratique des Hautes Études
 - **Calamari OCR:** https://github.com/Calamari-OCR/calamari — Christoph Wick et al., University of Würzburg
@@ -613,3 +659,6 @@ tjk_suetterlin/
 - **Zenodo Kurrent dataset:** https://zenodo.org/records/17252677 — 9,317 lines of 19th century German Kurrent
 - **READ16 Fraktur dataset:** https://zenodo.org/records/1164045 — READ 2016 competition dataset
 - **Ollama:** https://ollama.ai — Local LLM inference server
+- **UB Mannheim Kurrent model (2023):** https://zenodo.org/records/7933463 — German Kurrent `.mlmodel` for Kraken (CER ~3.5%)
+- **UB Mannheim Fraktur model (2023):** https://zenodo.org/records/6657809 — German Fraktur print `.mlmodel` for Kraken (CER ~1.8%)
+- **PAGE-XML schema:** http://schema.primaresearch.org/PAGE/gts/pagecontent/2019-07-15 — PRImA Research Lab

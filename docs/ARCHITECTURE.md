@@ -712,3 +712,363 @@ Without this flag, ComfyUI's execution optimizer might skip the node if it deter
 | `OUTPUT_NODE = True` for file-writing nodes | Forces execution even when outputs are unconnected |
 | Zero-batch placeholder (1×64×64×3) | ComfyUI cannot handle zero-batch tensors |
 | Fault-tolerant node registration | ComfyUI starts even if one module fails to import |
+| Path-only `KRAKEN_HTR_MODEL` dict | Avoids loading `.mlmodel` into ComfyUI process; model lives only in subprocess |
+| Full image to `kraken_htr_worker` | Kraken `rpred()` requires polygon coords relative to full image, not crops |
+| SWT via distance transform | More robust than projection variance for irregular line spacing |
+| stdlib-only PAGE-XML generation | No `lxml` dependency; `xml.etree.ElementTree` is always available |
+
+---
+
+## Kraken HTR Branch: New Components
+
+### `utils/kraken_htr_worker.py`
+
+[`utils/kraken_htr_worker.py`](../utils/kraken_htr_worker.py) is the HTR inference
+worker that runs inside the isolated `kraken_env/` subprocess. It is intentionally
+self-contained — it imports only packages available inside `kraken_env` and must not
+import anything from the `tjk_suetterlin` package.
+
+#### JSON Protocol
+
+**Invocation (from `KrakenHTRInference`):**
+```
+kraken_env/bin/python utils/kraken_htr_worker.py \
+    --image     /tmp/kraken_htr_img_XXXX.png   \
+    --bboxes_json /tmp/kraken_htr_bboxes_XXXX.json \
+    --model     /path/to/model.mlmodel          \
+    --device    auto                            \
+    --pad       16                              \
+    [--no_bidi]
+```
+
+The image and bboxes are written to temporary files by `KrakenHTRInference` before
+launching the subprocess. Both temp files are deleted in a `finally` block regardless
+of success or failure.
+
+**stdout** (parsed by `KrakenHTRInference`):
+```json
+[
+  {
+    "index": 0,
+    "text": "Im Jahre des Herrn",
+    "confidence": 0.923,
+    "bbox": [45, 120, 2480, 195],
+    "word_cuts": [
+      {"text": "Im",    "bbox": [45,  122, 110, 193], "confidence": 0.95},
+      {"text": "Jahre", "bbox": [120, 122, 250, 193], "confidence": 0.91}
+    ]
+  }
+]
+```
+
+**stderr:** Human-readable progress messages (forwarded to ComfyUI console by
+`KrakenHTRInference` with a `[kraken_htr_worker]` prefix).
+
+**Exit codes:**
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Argument / usage error (missing `--image`, bad JSON) |
+| 2 | Image load error (file not found, corrupt image) |
+| 3 | Model load error (file not found, incompatible format) |
+| 4 | Inference error (`rpred()` setup or iteration failed) |
+| 5 | Segmentation construction error |
+
+#### Building the `Segmentation` Object
+
+Kraken's `rpred()` requires a `Segmentation` object, not raw bboxes. The worker
+reconstructs this from the JSON output of `kraken_worker.py` (the segmentation worker)
+using a two-tier fallback strategy in [`_build_segmentation()`](../utils/kraken_htr_worker.py:69):
+
+**Tier 1 — `kraken.containers` (Kraken 6.x):**
+```python
+from kraken.containers import Segmentation, BaselineLine
+
+lines = [
+    BaselineLine(
+        id=f"line_{i}",
+        baseline=[tuple(pt) for pt in baseline],
+        boundary=[tuple(pt) for pt in polygon],
+        text=None,
+    )
+    for i, item in enumerate(line_data)
+]
+seg = Segmentation(
+    type="baselines",
+    imagename=getattr(image, "filename", "image"),
+    text_direction="horizontal-lr",
+    script_detection=False,
+    lines=lines,
+    regions={},
+)
+```
+
+If `baseline` or `polygon` is absent from the JSON item, the worker synthesises them
+from the bbox: baseline = horizontal midline, polygon = rectangular bbox corners.
+
+**Tier 2 — Legacy `_FakeSeg` (Kraken 4.x):**
+If `kraken.containers` is not importable, the worker builds a duck-typed `_FakeSeg`
+object with the same attributes that `rpred()` reads (`lines`, `imagename`, `type`,
+`text_direction`, `script_detection`, `regions`). Each line is a `_FakeLine` with
+`baseline`, `boundary`, `id`, `tags`, and `text` attributes.
+
+#### Word Cut Extraction
+
+[`_extract_word_cuts()`](../utils/kraken_htr_worker.py:172) groups character-level cuts
+from an `rpred` record into word bounding boxes:
+
+1. Iterate over `zip(prediction, cuts, confidences)` character by character
+2. When a space character is encountered, flush the current word buffer
+3. For each word, compute the bounding box as `min/max` of all character cut coordinates
+4. Compute average confidence across the word's characters
+
+The `cuts` attribute on an `rpred` record contains `(x1, y1, x2, y2)` tuples for each
+character. If `cuts` is unavailable (older Kraken versions), `_extract_word_cuts()`
+returns `[]` silently.
+
+---
+
+### `nodes/kraken_htr_nodes.py`
+
+#### `KrakenHTRModelLoader`
+
+[`KrakenHTRModelLoader`](../nodes/kraken_htr_nodes.py:220) downloads `.mlmodel` files
+from Zenodo and returns a `KRAKEN_HTR_MODEL` dict:
+
+```python
+{"path": "/abs/path/to/model.mlmodel", "script": "kurrent", "cer": 3.5, "display": "..."}
+```
+
+**Design decision: path-only dict, not a loaded model.**
+Unlike `LoadCalamariFrakturModel` (which loads the predictor into memory), this node
+returns only the file path. The `.mlmodel` is loaded inside the `kraken_env` subprocess
+by `kraken_htr_worker.py`. This is necessary because:
+- Kraken's model format (`vgsl.TorchVGSLModel`) requires Kraken's specific PyTorch
+  version, which conflicts with ComfyUI's PyTorch
+- Loading the model in the main process would require importing `kraken.lib.models`,
+  which triggers Kraken's dependency chain and causes import errors
+
+**Module-level path cache:** `_KRAKEN_HTR_MODEL_PATH_CACHE` (a module-level dict) caches
+`model_key:models_base_dir → local_path` so repeated calls don't re-check the filesystem.
+The cache is bypassed when `force_redownload=True`.
+
+**Download strategy:** Uses `urllib.request` with streaming 1 MB chunks and a
+`User-Agent: ComfyUI-HTR/1.0` header (required by Zenodo's CDN). Partial downloads are
+cleaned up on failure. The download URL is stored in `KRAKEN_HTR_MODEL_REGISTRY` and
+points directly to the Zenodo file endpoint.
+
+#### `KrakenHTRInference`
+
+[`KrakenHTRInference`](../nodes/kraken_htr_nodes.py:306) is the main HTR node.
+
+**Design decision: full image, not line crops.**
+TrOCR takes pre-cropped line images as input. Kraken's `rpred()` takes the full document
+image plus polygon coordinates and crops each line internally. This is because Kraken's
+line extraction uses the polygon boundary (not a rectangular crop) to mask out
+neighbouring lines, which improves accuracy on documents with overlapping ascenders and
+descenders. Passing pre-cropped images would make the polygon coordinates meaningless.
+
+**IPC flow:**
+```
+KrakenHTRInference.run_htr()
+  │
+  ├─ tensor → PIL → save to /tmp/kraken_htr_img_XXXX.png
+  ├─ bboxes JSON → save to /tmp/kraken_htr_bboxes_XXXX.json
+  │
+  ├─ subprocess.run([kraken_env/bin/python, utils/kraken_htr_worker.py,
+  │                  --image, --bboxes_json, --model, --device, --pad, ...])
+  │
+  ├─ parse JSON from stdout
+  ├─ extract texts, confidences, word_cuts
+  └─ return (transcription, lines_json, confidences_json, word_cuts_json)
+```
+
+Both temp files are deleted in a `finally` block. The subprocess has a 300-second
+timeout; if exceeded, a `RuntimeError` is raised suggesting `device='cpu'` or a smaller
+image.
+
+**stderr forwarding:** All stderr lines from the worker are printed to the ComfyUI
+console with a `[kraken_htr_worker]` prefix, making it easy to diagnose model loading
+or inference errors without inspecting the subprocess directly.
+
+#### `KrakenWordSegmentation`
+
+[`KrakenWordSegmentation`](../nodes/kraken_htr_nodes.py:534) provides two word
+segmentation modes:
+
+**`opencv_cc` mode** (default, no HTR required):
+Uses OpenCV connected components on a binarized line crop. A horizontal dilation kernel
+of width `min_gap_px` merges characters within a word before finding contours. Falls back
+to a pure-numpy projection profile gap analysis if `cv2` is not available.
+
+**`kraken_cuts` mode** (requires `word_cuts_json` from `KrakenHTRInference`):
+Uses the character-level cut data from `rpred()`. This is more accurate for Kurrent
+because Kraken's model has already segmented the characters; the word boundaries are
+simply the spaces in the predicted text. The `word_cuts_json` input is the `word_cuts`
+field from each line result in `lines_json`.
+
+Both modes return word crops as a batch IMAGE tensor (height-normalised to 64px, same
+as the standard `_pil2tensor` pattern) plus a `word_bboxes_json` with absolute image
+coordinates.
+
+#### `KrakenMixedScriptRouter` (registered as `MixedScriptRouter` in `kraken_htr_nodes.py`)
+
+[`MixedScriptRouter`](../nodes/kraken_htr_nodes.py:741) in `kraken_htr_nodes.py` is
+distinct from `MixedScriptRouter` in `calamari_nodes.py`. The key differences:
+
+| Aspect | `calamari_nodes.MixedScriptRouter` | `kraken_htr_nodes.MixedScriptRouter` |
+|--------|-------------------------------------|---------------------------------------|
+| Input label format | `printed_mask_json` (list of booleans) | `labels_json` (list of dicts with `"label"` key) |
+| Output slots | `printed_lines`, `handwritten_lines`, `routing_json`, `printed_count`, `handwritten_count` | `kurrent_lines`, `fraktur_lines`, `kurrent_bboxes_json`, `fraktur_bboxes_json`, `routing_json` |
+| Bbox sub-lists | Not output | Output as separate JSON strings |
+| `routing_json` format | `{"printed_indices": [...], "handwritten_indices": [...], "total": N}` | `{"kurrent_indices": [...], "fraktur_indices": [...], "printed_indices": [...], "handwritten_indices": [...], "total": N, "script_map": {"0": "kurrent", ...}}` |
+
+The `routing_json` from `kraken_htr_nodes.MixedScriptRouter` includes both
+`kurrent_indices`/`fraktur_indices` (new names) and `printed_indices`/`handwritten_indices`
+(aliases) so it is compatible with both `PageXMLMerger` and the existing
+`MergeTranscriptions` node.
+
+**Placeholder behaviour:** When one sub-batch is empty, a `1×64×64×3` white tensor
+(`torch.ones(...)`) is returned instead of a zero-batch tensor. This is the same pattern
+as `calamari_nodes.MixedScriptRouter` but uses white (1.0) instead of black (0.0) to
+avoid confusing Kraken's binarization step if the placeholder is accidentally passed to
+`KrakenHTRInference`.
+
+---
+
+### `nodes/pagexml_nodes.py`
+
+#### PAGE-XML Generation Approach
+
+[`nodes/pagexml_nodes.py`](../nodes/pagexml_nodes.py) uses Python's stdlib
+`xml.etree.ElementTree` exclusively — no `lxml`, no external XML library. This keeps
+the dependency footprint minimal and avoids version conflicts.
+
+**Namespace registration:**
+```python
+ET.register_namespace("", PAGE_NS)
+```
+This causes ElementTree to use the default namespace prefix (no `ns0:` prefix) in the
+output, producing clean `<PcGts>` instead of `<ns0:PcGts xmlns:ns0="...">`.
+
+**Pretty-printing:** Uses `ET.indent()` (Python 3.9+) with a fallback recursive
+indentation function for Python 3.8. The fallback is necessary because `kraken_env`
+may use Python 3.8 on some systems.
+
+**Polygon vs bbox fallback:**
+```python
+if polygon and len(polygon) >= 3:
+    coords_el.set("points", _polygon_to_coords(polygon))
+else:
+    coords_el.set("points", _bbox_to_coords(bbox))
+```
+Kraken's BLLA segmentation provides polygon boundaries for each line. When these are
+present in the `bboxes` JSON, they are used for `<Coords>` (more accurate). When absent
+(e.g. if the bboxes came from a non-Kraken segmenter), rectangular coordinates are used.
+
+**Word element support:**
+`PageXMLExporter` accepts an optional `word_bboxes_json` input (from
+`KrakenWordSegmentation`). When present, `<Word>` child elements are added to each
+`<TextLine>`. Word text is included only in `kraken_cuts` mode (where the word text
+comes from the HTR model); in `opencv_cc` mode, `<Word>` elements have empty
+`<TextEquiv>`.
+
+**`PageXMLMerger` reconstruction logic:**
+```python
+merged_lines = [{"text": "", "confidence": None, "model": "none"}
+                for _ in range(max(total, len(line_data)))]
+
+for i, orig_idx in enumerate(kurrent_indices):
+    if orig_idx < len(merged_lines) and i < len(hw_lines):
+        merged_lines[orig_idx] = {
+            "text": hw_lines[i].get("text", ""),
+            "confidence": hw_lines[i].get("confidence"),
+            "model": "kurrent_htr",
+        }
+
+for i, orig_idx in enumerate(fraktur_indices):
+    if orig_idx < len(merged_lines) and i < len(pr_lines):
+        merged_lines[orig_idx] = {
+            "text": pr_lines[i].get("text", ""),
+            "confidence": pr_lines[i].get("confidence"),
+            "model": "fraktur_htr",
+        }
+```
+Lines not covered by either index list (e.g. if routing_json is incomplete) remain as
+`{"text": "", "model": "none"}`. The `model` value is written to the `custom` attribute
+of each `<TextLine>` element.
+
+**`OUTPUT_NODE = True`:** Both `PageXMLExporter` and `PageXMLMerger` set this flag,
+ensuring ComfyUI always executes them even when their outputs are not connected to
+anything downstream. Without this flag, ComfyUI's execution optimizer would skip the
+nodes if `xml_string` and `output_path` are unconnected, and no file would be saved.
+
+---
+
+### Print/Handwriting Classification: SWT Approach
+
+[`PrintedHandwrittenClassifierV2`](../nodes/calamari_nodes.py:878) adds a
+Stroke Width Transform (SWT) classifier alongside the existing projection variance
+method.
+
+#### Why SWT Works
+
+Printed typefaces (Fraktur, Antiqua) are designed with **uniform stroke widths** — the
+ratio of thick to thin strokes is fixed by the typeface design. Handwritten text has
+**variable stroke widths** because pen pressure, angle, and speed vary continuously.
+
+The SWT approximation uses OpenCV's distance transform:
+
+```python
+import cv2
+gray = np.array(pil_img.convert("L"))
+_, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+ink_pixels = dist[binary > 0]  # distance values only at ink pixels
+mean_sw = float(np.mean(ink_pixels))
+std_sw  = float(np.std(ink_pixels))
+cv = std_sw / (mean_sw + 1e-6)  # coefficient of variation
+label = "printed" if cv < threshold else "handwritten"
+```
+
+The distance transform assigns each ink pixel its distance to the nearest background
+pixel. For a stroke of width `w`, the centre pixel has distance `w/2`. The coefficient
+of variation (CV = std/mean) of these distances measures stroke width uniformity:
+
+- **Printed Fraktur:** CV typically 0.1–0.25 (uniform strokes)
+- **Handwritten Kurrent:** CV typically 0.35–0.7 (variable strokes)
+- **Default threshold:** 0.3
+
+#### Why SWT Over Projection Variance
+
+The projection variance method (used by `PrintedHandwrittenClassifier`) measures
+row-level ink density variance. It works well for clean documents but fails on:
+- Lines with large ascenders/descenders that happen to be regular (classified as printed)
+- Printed lines with ink bleed or uneven inking (classified as handwritten)
+- Documents scanned at an angle (projection profile is smeared)
+
+SWT is more robust because it operates at the pixel level rather than the row level,
+and is invariant to line tilt and uneven ink density.
+
+#### OpenCV Fallback
+
+If `cv2` is not available, `_swt_classify_single()` falls back to
+`_classify_single_line()` (the projection variance method) with a fixed threshold of
+50.0. This means `stroke_width_transform` and `combined` modes degrade gracefully to
+projection variance when OpenCV is not installed.
+
+---
+
+### Updated Design Decisions Table
+
+The following rows extend the table in [Section 10](#summary-key-design-decisions):
+
+| Decision | Rationale |
+|----------|-----------|
+| Path-only `KRAKEN_HTR_MODEL` dict | Avoids loading `.mlmodel` into ComfyUI process; Kraken's model format requires Kraken's PyTorch version, which conflicts with ComfyUI's |
+| Full document image to `kraken_htr_worker` | Kraken `rpred()` requires polygon coordinates relative to the full image; pre-cropped images make polygon coords meaningless |
+| White placeholder (1×64×64×3, `torch.ones`) | Avoids confusing Kraken's binarization if placeholder is accidentally passed to `KrakenHTRInference` (black placeholder would be binarized as all-ink) |
+| stdlib-only PAGE-XML (`xml.etree.ElementTree`) | No `lxml` dependency; avoids version conflicts; `ET.register_namespace` produces clean output without `ns0:` prefixes |
+| SWT via distance transform (not full SWT algorithm) | Full SWT (Epshtein et al. 2010) is expensive; distance transform approximation achieves similar discrimination at a fraction of the cost |
+| `routing_json` dual-key format | `kurrent_indices`/`fraktur_indices` for new nodes; `printed_indices`/`handwritten_indices` aliases for backward compatibility with `MergeTranscriptions` |
