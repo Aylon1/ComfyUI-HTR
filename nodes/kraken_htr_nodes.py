@@ -14,10 +14,12 @@ dependency conflicts with ComfyUI's main environment.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -110,6 +112,211 @@ KRAKEN_HTR_MODEL_REGISTRY = {
 
 # ── Module-level path cache ───────────────────────────────────────────────────
 _KRAKEN_HTR_MODEL_PATH_CACHE = {}  # key: model_key → local path str
+
+
+# ── Models directory resolver ─────────────────────────────────────────────────
+
+def _get_kraken_htr_models_dir():
+    """
+    Return the kraken_htr models directory, preferring the ComfyUI folder_paths
+    registration if available, otherwise falling back to the default path.
+    Creates the directory if it does not exist.
+    """
+    try:
+        import folder_paths
+        paths = folder_paths.get_folder_paths("kraken_htr")
+        if paths:
+            d = paths[0]
+        else:
+            d = os.path.join(folder_paths.models_dir, "kraken_htr")
+    except Exception:
+        d = KRAKEN_HTR_MODELS_DIR
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+# ── Dynamic model discovery ───────────────────────────────────────────────────
+
+def get_available_kraken_htr_models():
+    """
+    Build a sorted list of display names for the KrakenHTRModelLoader dropdown.
+
+    1. Starts with all hardcoded registry entries (friendly display names).
+    2. Scans the kraken_htr models directory recursively for *.mlmodel files.
+    3. For each discovered file that is NOT already represented by a registry
+       entry (matched by filename), adds a ``[local] <filename>`` entry.
+
+    Returns a list of display-name strings (the values shown in the dropdown).
+    The list is used both as the dropdown choices AND as the key passed to
+    ``load_model`` — so the format must be stable.
+    """
+    # Collect registry display names and the filenames they cover
+    registry_filenames = set()
+    display_names = []
+    for key, info in KRAKEN_HTR_MODEL_REGISTRY.items():
+        display_names.append(info["display"])
+        if info.get("filename"):
+            registry_filenames.add(info["filename"].lower())
+
+    # Scan models directory for .mlmodel files not already in the registry
+    models_dir = _get_kraken_htr_models_dir()
+    local_extras = []
+    try:
+        for root, _dirs, files in os.walk(models_dir):
+            for fname in files:
+                if fname.lower().endswith(".mlmodel"):
+                    if fname.lower() not in registry_filenames:
+                        local_extras.append(f"[local] {fname}")
+    except OSError:
+        pass  # directory may not exist yet or be unreadable
+
+    # Deduplicate local extras (same filename in multiple subdirs → keep first)
+    seen_local = set()
+    unique_extras = []
+    for name in local_extras:
+        if name not in seen_local:
+            seen_local.add(name)
+            unique_extras.append(name)
+
+    return display_names + sorted(unique_extras)
+
+
+# ── Zenodo record URL resolver ────────────────────────────────────────────────
+
+_ZENODO_RECORD_RE = re.compile(
+    r"zenodo\.org/(?:records?|deposit)/(\d+)", re.IGNORECASE
+)
+
+
+def _resolve_zenodo_record_url(record_url):
+    """
+    Given a Zenodo record page URL (e.g. ``https://zenodo.org/records/13788177``),
+    query the Zenodo REST API and return ``(download_url, filename)`` for the
+    first ``.mlmodel`` file found in the record.
+
+    Returns ``(None, None)`` if no ``.mlmodel`` file is found or on error.
+    """
+    m = _ZENODO_RECORD_RE.search(record_url)
+    if not m:
+        return None, None
+    record_id = m.group(1)
+    api_url = f"https://zenodo.org/api/records/{record_id}"
+    _safe_print(
+        f"[KrakenHTRModelLoader] Querying Zenodo API for record {record_id}: {api_url}",
+        flush=True,
+    )
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "ComfyUI-HTR/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        files = data.get("files", [])
+        for f in files:
+            key = f.get("key", "")
+            if key.lower().endswith(".mlmodel"):
+                url = f.get("links", {}).get("self", "")
+                if url:
+                    _safe_print(
+                        f"[KrakenHTRModelLoader] Zenodo record {record_id}: "
+                        f"found '{key}' → {url}",
+                        flush=True,
+                    )
+                    return url, key
+        available = [f.get("key", "?") for f in files]
+        _safe_print(
+            f"[KrakenHTRModelLoader] Zenodo record {record_id}: no .mlmodel file found. "
+            f"Available files: {available}",
+            flush=True,
+        )
+    except Exception as e:
+        _safe_print(
+            f"[KrakenHTRModelLoader] Zenodo API query failed for record {record_id}: {e}",
+            flush=True,
+        )
+    return None, None
+
+
+# ── Arbitrary URL downloader ──────────────────────────────────────────────────
+
+def _download_from_url(url, models_base_dir):
+    """
+    Download a ``.mlmodel`` file from an arbitrary URL (or a Zenodo record page)
+    into ``models_base_dir/<stem>/<filename>``.
+
+    Handles two URL patterns:
+      - Direct download link ending in ``.mlmodel`` (or with a ``.mlmodel``
+        filename in the path/query).
+      - Zenodo record page URL (``zenodo.org/records/<id>``): resolved via the
+        Zenodo REST API to find the actual download URL and filename.
+
+    Returns the absolute path to the downloaded file.
+    Raises ``RuntimeError`` on failure.
+    """
+    original_url = url.strip()
+
+    # ── Detect Zenodo record page URL ─────────────────────────────────────────
+    if _ZENODO_RECORD_RE.search(original_url) and ".mlmodel" not in original_url.lower():
+        _safe_print(
+            f"[KrakenHTRModelLoader] Detected Zenodo record URL — resolving via API…",
+            flush=True,
+        )
+        resolved_url, filename = _resolve_zenodo_record_url(original_url)
+        if resolved_url is None:
+            raise RuntimeError(
+                f"[KrakenHTRModelLoader] Could not find a .mlmodel file at Zenodo URL: "
+                f"{original_url}\n"
+                f"Check the record page and paste the direct download link instead."
+            )
+        url = resolved_url
+    else:
+        # ── Extract filename from URL path ────────────────────────────────────
+        parsed = urllib.parse.urlparse(original_url)
+        filename = os.path.basename(parsed.path)
+        if not filename.lower().endswith(".mlmodel"):
+            # Try query string (some CDNs encode filename there)
+            qs = urllib.parse.parse_qs(parsed.query)
+            for v in qs.values():
+                for item in v:
+                    if item.lower().endswith(".mlmodel"):
+                        filename = item
+                        break
+        if not filename.lower().endswith(".mlmodel"):
+            raise RuntimeError(
+                f"[KrakenHTRModelLoader] Cannot determine .mlmodel filename from URL: "
+                f"{original_url}\n"
+                f"Use a direct download link or a Zenodo record page URL."
+            )
+
+    stem = os.path.splitext(filename)[0]
+    target_dir = os.path.join(models_base_dir, stem)
+    target_path = os.path.join(target_dir, filename)
+
+    if os.path.isfile(target_path):
+        _safe_print(
+            f"[KrakenHTRModelLoader] Model already downloaded: {target_path}",
+            flush=True,
+        )
+        return target_path
+
+    os.makedirs(target_dir, exist_ok=True)
+    _safe_print(
+        f"[KrakenHTRModelLoader] Downloading '{filename}' from:\n  {url}",
+        flush=True,
+    )
+    try:
+        _stream_download(url, target_path, filename, size_mb="?")
+    except Exception as e:
+        if os.path.exists(target_path):
+            os.remove(target_path)
+        raise RuntimeError(
+            f"[KrakenHTRModelLoader] Download failed for '{filename}': {e}\n"
+            f"URL: {url}\n"
+            f"Try downloading manually and placing at: {target_path}"
+        )
+    _safe_print(
+        f"[KrakenHTRModelLoader] Download complete → {target_path}",
+        flush=True,
+    )
+    return target_path
 
 
 # ── Tensor ↔ PIL helpers ──────────────────────────────────────────────────────
@@ -353,62 +560,110 @@ class KrakenHTRModelLoader:
 
     @classmethod
     def INPUT_TYPES(cls):
+        available = get_available_kraken_htr_models()
         return {
             "required": {
-                "model": (list(KRAKEN_HTR_MODEL_REGISTRY.keys()),),
+                "model": (available,),
                 "models_base_dir": ("STRING", {
-                    "default": KRAKEN_HTR_MODELS_DIR,
+                    "default": _get_kraken_htr_models_dir(),
                     "multiline": False,
+                    "tooltip": "Directory where .mlmodel files are stored. "
+                               "Newly placed files appear after a ComfyUI refresh.",
                 }),
             },
             "optional": {
-                "custom_model_path": ("STRING", {
+                "download_url": ("STRING", {
                     "default": "",
                     "multiline": False,
-                    "tooltip": "Absolute path to a local .mlmodel file. "
-                               "Overrides the model dropdown when non-empty.",
+                    "tooltip": (
+                        "Optional: URL to download a .mlmodel file. "
+                        "Supports direct .mlmodel links and Zenodo record page URLs "
+                        "(e.g. https://zenodo.org/records/13788177). "
+                        "Leave empty to use the dropdown selection."
+                    ),
                 }),
                 "force_redownload": ("BOOLEAN", {"default": False}),
             },
         }
 
     def load_model(self, model, models_base_dir,
-                   custom_model_path="", force_redownload=False):
+                   download_url="", force_redownload=False):
         global _KRAKEN_HTR_MODEL_PATH_CACHE
 
-        # ── Custom path override ──────────────────────────────────────────────
-        if custom_model_path and custom_model_path.strip():
-            path = custom_model_path.strip()
-            if not os.path.isfile(path):
+        # ── URL download override ─────────────────────────────────────────────
+        if download_url and download_url.strip():
+            url = download_url.strip()
+            _safe_print(
+                f"[KrakenHTRModelLoader] download_url provided — downloading from: {url}",
+                flush=True,
+            )
+            local_path = _download_from_url(url, models_base_dir)
+            fname = os.path.basename(local_path)
+            return ({"path": local_path, "script": "custom", "cer": None,
+                     "display": f"URL download: {fname}"},)
+
+        # ── [local] file discovered by directory scan ─────────────────────────
+        if model.startswith("[local] "):
+            fname = model[len("[local] "):]
+            models_dir = models_base_dir
+            # Walk the models directory to find the file
+            found_path = None
+            try:
+                for root, _dirs, files in os.walk(models_dir):
+                    if fname in files:
+                        found_path = os.path.join(root, fname)
+                        break
+            except OSError:
+                pass
+            if found_path is None or not os.path.isfile(found_path):
                 raise FileNotFoundError(
-                    f"[KrakenHTRModelLoader] Custom model not found: {path}"
+                    f"[KrakenHTRModelLoader] Local model '{fname}' not found under "
+                    f"{models_dir}. "
+                    f"Make sure the file exists and refresh ComfyUI."
                 )
-            _safe_print(f"[KrakenHTRModelLoader] Using custom model: {path}", flush=True)
-            return ({"path": path, "script": "custom", "cer": None,
-                     "display": f"Custom: {os.path.basename(path)}"},)
+            _safe_print(
+                f"[KrakenHTRModelLoader] Using local model: {found_path}", flush=True
+            )
+            return ({"path": found_path, "script": "custom", "cer": None,
+                     "display": f"[local] {fname}"},)
 
-        # ── Registry model ────────────────────────────────────────────────────
-        registry = KRAKEN_HTR_MODEL_REGISTRY[model]
+        # ── Registry model lookup ─────────────────────────────────────────────
+        # Find the registry key whose display name matches the selected value
+        registry_key = None
+        registry = None
+        for key, info in KRAKEN_HTR_MODEL_REGISTRY.items():
+            if info["display"] == model:
+                registry_key = key
+                registry = info
+                break
 
-        if model == "custom":
+        if registry is None:
             raise ValueError(
-                "[KrakenHTRModelLoader] Select a specific model from the dropdown "
-                "or provide a custom_model_path."
+                f"[KrakenHTRModelLoader] Unknown model selection: '{model}'. "
+                f"Please refresh ComfyUI to update the model list."
             )
 
-        cache_key = f"{model}:{models_base_dir}"
+        if registry_key == "custom":
+            raise ValueError(
+                "[KrakenHTRModelLoader] Select a specific model from the dropdown "
+                "or provide a download_url."
+            )
+
+        cache_key = f"{registry_key}:{models_base_dir}"
         if cache_key in _KRAKEN_HTR_MODEL_PATH_CACHE and not force_redownload:
             cached_path = _KRAKEN_HTR_MODEL_PATH_CACHE[cache_key]
             if os.path.isfile(cached_path):
-                _safe_print(f"[KrakenHTRModelLoader] Using cached path: {cached_path}",
-                             flush=True)
+                _safe_print(
+                    f"[KrakenHTRModelLoader] Using cached path: {cached_path}",
+                    flush=True,
+                )
                 return ({"path": cached_path,
                          "script": registry["script"],
                          "cer": registry.get("cer"),
                          "display": registry["display"]},)
 
         local_path = _download_kraken_htr_model(
-            model, models_base_dir, registry, force_redownload
+            registry_key, models_base_dir, registry, force_redownload
         )
         _KRAKEN_HTR_MODEL_PATH_CACHE[cache_key] = local_path
 
@@ -1110,9 +1365,37 @@ class KrakenWordHTRInference:
                 f"[KrakenWordHTRInference] Model file not found: {model_path}"
             )
 
-        # ── 2. Convert word image batch → list of PIL images ──────────────────
+        _safe_print(
+            f"[KrakenWordHTRInference] word_images tensor shape: {word_images.shape}",
+            flush=True,
+        )
+
+        # ── 2. Placeholder guard ──────────────────────────────────────────────
+        # KrakenMixedScriptRouter emits a 1×64×64×3 white tensor when one
+        # sub-batch is empty (e.g. all words are handwritten → fraktur branch
+        # gets a placeholder).  _tensor2pil() converts this to 1 PIL image,
+        # bypassing the n_words==0 guard below.  Detect it here and return
+        # a descriptive message instead of running the worker on a white image.
+        _PLACEHOLDER_SHAPE = torch.Size([1, 64, 64, 3])
+        if word_images.shape == _PLACEHOLDER_SHAPE:
+            # Confirm it's actually all-white (not a real 64×64 word crop)
+            if word_images.max().item() >= 0.99 and word_images.min().item() >= 0.99:
+                msg = "(no words routed to this model)"
+                _safe_print(
+                    f"[KrakenWordHTRInference] Detected 1×64×64×3 white placeholder — "
+                    "no words were routed to this model branch. Returning early.",
+                    flush=True,
+                )
+                return (msg, "[]")
+
+        # ── 3. Convert word image batch → list of PIL images ──────────────────
         pil_words = _tensor2pil(word_images)
         n_words = len(pil_words)
+
+        _safe_print(
+            f"[KrakenWordHTRInference] num word crops: {n_words}",
+            flush=True,
+        )
 
         if n_words == 0:
             return ("", "[]")
@@ -1122,6 +1405,7 @@ class KrakenWordHTRInference:
         # Saving each crop individually avoids PIL DecompressionBombError and
         # ensures correct single-line inference (no synthetic stacked bboxes).
         tmpdir = tempfile.mkdtemp(prefix="kraken_words_")
+        _safe_print(f"[KrakenWordHTRInference] tmpdir: {tmpdir}", flush=True)
         try:
             word_paths = []
             for i, pil_img in enumerate(pil_words):
@@ -1139,6 +1423,11 @@ class KrakenWordHTRInference:
             with open(paths_json, "w", encoding="utf-8") as f:
                 json.dump(word_paths, f, ensure_ascii=False)
 
+            _safe_print(
+                f"[KrakenWordHTRInference] paths.json contains {len(word_paths)} paths",
+                flush=True,
+            )
+
             # ── 4. Build subprocess command ───────────────────────────────────
             cmd = [
                 KRAKEN_ENV_PYTHON,
@@ -1152,6 +1441,10 @@ class KrakenWordHTRInference:
             _safe_print(
                 f"[KrakenWordHTRInference] Running HTR on {n_words} word crop(s) "
                 f"(action=transcribe_words) with model: {os.path.basename(model_path)}",
+                flush=True,
+            )
+            _safe_print(
+                f"[KrakenWordHTRInference] subprocess cmd: {' '.join(cmd)}",
                 flush=True,
             )
 
@@ -1169,7 +1462,21 @@ class KrakenWordHTRInference:
                     "[KrakenWordHTRInference] Worker timed out after 600 s."
                 )
 
+            _safe_print(
+                f"[KrakenWordHTRInference] subprocess returncode: {proc.returncode}",
+                flush=True,
+            )
+            _safe_print(
+                f"[KrakenWordHTRInference] subprocess stdout[:200]: "
+                f"{proc.stdout[:200]}",
+                flush=True,
+            )
             if proc.stderr:
+                _safe_print(
+                    f"[KrakenWordHTRInference] subprocess stderr[:500]: "
+                    f"{proc.stderr[:500]}",
+                    flush=True,
+                )
                 for line in proc.stderr.strip().splitlines():
                     _safe_print(f"  [kraken_htr_worker] {line}", flush=True)
 

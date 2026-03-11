@@ -60,6 +60,7 @@ EXIT CODES:
 
 import argparse
 import json
+import os
 import sys
 
 
@@ -454,6 +455,47 @@ def _action_transcribe(args, device, bidi):
 
 # ── Action: transcribe_words (per-word, no stacking) ─────────────────────────
 
+def _build_bbox_segmentation(image, bbox):
+    """
+    Build a Segmentation with a single BBoxLine for a rectangular word crop.
+
+    Uses BBoxLine (type="bbox") instead of BaselineLine (type="baselines").
+    BBoxLine does a simple rectangular crop — no polygon warping — which is
+    correct for pre-cropped word images.  BaselineLine would warp along the
+    synthesized midline baseline, producing a near-zero-height strip on a
+    64 px tall image and yielding empty predictions.
+
+    Returns (segmentation, "BBoxLine") or falls back to _build_segmentation()
+    with a warning if BBoxLine is unavailable.
+    """
+    x1, y1, x2, y2 = bbox
+    try:
+        from kraken.containers import BBoxLine, Segmentation
+        line = BBoxLine(
+            id="word_0",
+            bbox=(x1, y1, x2, y2),
+            text=None,
+            tags=None,
+        )
+        seg = Segmentation(
+            type="bbox",
+            imagename=getattr(image, "filename", "word"),
+            text_direction="horizontal-lr",
+            script_detection=False,
+            lines=[line],
+            regions={},
+        )
+        return seg, "BBoxLine"
+    except ImportError:
+        # Kraken version without BBoxLine — fall back to baseline segmentation
+        # with a warning (predictions may be degraded on small word crops)
+        print("[kraken_htr_worker] WARNING: BBoxLine not available; "
+              "falling back to BaselineLine (predictions may be empty on small crops)",
+              file=sys.stderr)
+        single_line = [{"bbox": [x1, y1, x2, y2]}]
+        return _build_segmentation(image, single_line)
+
+
 def _action_transcribe_words(args, device):
     """
     Process each word crop individually as a single-line document.
@@ -462,6 +504,10 @@ def _action_transcribe_words(args, device):
     to individual word PNG files (one per word).  Each word image is treated as
     a single-line document: a Segmentation with one BBoxLine spanning the full
     image is constructed and rpred() is called once per word.
+
+    Key fix: uses BBoxLine + Segmentation(type="bbox") instead of BaselineLine.
+    BaselineLine causes rpred() to warp along the baseline, producing a
+    near-zero-height strip on 64 px word crops → empty predictions.
 
     Outputs to stdout:
         {"words": [{"text": "...", "confidence": 0.0}, ...], "error": null}
@@ -504,10 +550,14 @@ def _action_transcribe_words(args, device):
         try:
             word_img = Image.open(word_path).convert("RGB")
             w, h = word_img.size
+            print(f"[kraken_htr_worker] Word {word_idx}: {os.path.basename(word_path)} "
+                  f"size={w}x{h}", file=sys.stderr)
 
-            # Build a single-line Segmentation spanning the full word image
-            single_line = [{"bbox": [0, 0, w, h]}]
-            seg, _ = _build_segmentation(word_img, single_line)
+            # Build a BBoxLine segmentation spanning the full word image.
+            # BBoxLine does a simple rectangular crop (no baseline warping).
+            seg, seg_type = _build_bbox_segmentation(word_img, (0, 0, w, h))
+            print(f"[kraken_htr_worker] Word {word_idx}: segmentation type={seg_type}",
+                  file=sys.stderr)
 
             pred_it = kraken_rpred.rpred(
                 network=model,
@@ -530,7 +580,7 @@ def _action_transcribe_words(args, device):
                       f"(conf={avg_conf:.3f})", file=sys.stderr)
             else:
                 results.append({"text": "", "confidence": 0.0})
-                print(f"[kraken_htr_worker] Word {word_idx}: no prediction",
+                print(f"[kraken_htr_worker] Word {word_idx}: rpred() returned no record",
                       file=sys.stderr)
 
         except Exception as e:

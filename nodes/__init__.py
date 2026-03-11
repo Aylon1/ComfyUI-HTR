@@ -180,4 +180,19 @@ try:
 except Exception as e:
     logger.warning(f"Could not import training_nodes: {e}")
 
+try:
+    from .annotation_nodes import (
+        AnnotationSessionInit,
+        AnnotationCropExporter,
+        AnnotationSessionStatus,
+    )
+    NODE_CLASS_MAPPINGS["AnnotationSessionInit"] = AnnotationSessionInit
+    NODE_CLASS_MAPPINGS["AnnotationCropExporter"] = AnnotationCropExporter
+    NODE_CLASS_MAPPINGS["AnnotationSessionStatus"] = AnnotationSessionStatus
+    NODE_DISPLAY_NAME_MAPPINGS["AnnotationSessionInit"] = "Annotation Session Init"
+    NODE_DISPLAY_NAME_MAPPINGS["AnnotationCropExporter"] = "Annotation Crop Exporter"
+    NODE_DISPLAY_NAME_MAPPINGS["AnnotationSessionStatus"] = "Annotation Session Status"
+except Exception as e:
+    logger.warning(f"Could not import annotation_nodes: {e}")
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
