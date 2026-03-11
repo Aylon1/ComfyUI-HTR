@@ -430,21 +430,27 @@ class AnnotationCropExporter:
             word_entries = []
 
             for word_idx, box in enumerate(boxes):
-                x = int(box.get("x", 0))
-                y = int(box.get("y", 0))
-                w = int(box.get("w", 0))
-                h = int(box.get("h", 0))
+                is_full_line = box.get("full_line") is True or int(box.get("w", 0)) == -1
 
-                # Clamp to image bounds
-                x1 = max(0, x)
-                y1 = max(0, y)
-                x2 = min(img_w, x + w)
-                y2 = min(img_h, y + h)
+                if is_full_line:
+                    # Use full line image dimensions
+                    x1, y1, x2, y2 = 0, 0, img_w, img_h
+                else:
+                    x = int(box.get("x", 0))
+                    y = int(box.get("y", 0))
+                    w = int(box.get("w", 0))
+                    h = int(box.get("h", 0))
+
+                    # Clamp to image bounds
+                    x1 = max(0, x)
+                    y1 = max(0, y)
+                    x2 = min(img_w, x + w)
+                    y2 = min(img_h, y + h)
 
                 crop_w = x2 - x1
                 crop_h = y2 - y1
 
-                if crop_w < min_width or crop_h < min_height:
+                if not is_full_line and (crop_w < min_width or crop_h < min_height):
                     continue
 
                 crop = line_img.crop((x1, y1, x2, y2))
@@ -455,12 +461,15 @@ class AnnotationCropExporter:
                     crop.save(str(crop_path), format="PNG")
                     exported_count += 1
                     all_crop_pils.append(crop)
-                    word_entries.append({
+                    word_entry: dict = {
                         "word_index": word_idx,
                         "bbox_in_line": [x1, y1, x2, y2],
                         "crop_filename": crop_filename,
                         "label": label,
-                    })
+                    }
+                    if is_full_line:
+                        word_entry["full_line"] = True
+                    word_entries.append(word_entry)
                 except Exception as e:
                     export_errors.append(f"Line {line_idx} word {word_idx}: save error: {e}")
 
@@ -477,19 +486,22 @@ class AnnotationCropExporter:
             line_idx = line_meta["line_index"]
             for word_entry in line_meta["words"]:
                 crop_filename = word_entry["crop_filename"]
-                session_crops[crop_filename] = {
-                    "session_id": session_id,
-                    "doc_id": doc_id,
-                    "line_index": line_idx,
-                    "word_index": word_entry["word_index"],
-                    "bbox_in_line": {
-                        "x": word_entry["bbox_in_line"][0],
-                        "y": word_entry["bbox_in_line"][1],
-                        "w": word_entry["bbox_in_line"][2] - word_entry["bbox_in_line"][0],
-                        "h": word_entry["bbox_in_line"][3] - word_entry["bbox_in_line"][1],
-                    },
-                    "source_line_image": f"sessions/{session_id}/lines/line_{line_idx:04d}.png",
-                }
+                meta_entry: dict = {
+                        "session_id": session_id,
+                        "doc_id": doc_id,
+                        "line_index": line_idx,
+                        "word_index": word_entry["word_index"],
+                        "bbox_in_line": {
+                            "x": word_entry["bbox_in_line"][0],
+                            "y": word_entry["bbox_in_line"][1],
+                            "w": word_entry["bbox_in_line"][2] - word_entry["bbox_in_line"][0],
+                            "h": word_entry["bbox_in_line"][3] - word_entry["bbox_in_line"][1],
+                        },
+                        "source_line_image": f"sessions/{session_id}/lines/line_{line_idx:04d}.png",
+                    }
+                if word_entry.get("full_line"):
+                    meta_entry["full_line"] = True
+                session_crops[crop_filename] = meta_entry
 
         # --- Write per-session metadata file ---
         session_metadata_path = base_dir / label / f"metadata_{session_id}.json"

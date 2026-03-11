@@ -169,28 +169,56 @@ class AnnotationCanvas {
             ctx.fillText("No image loaded", 20, 30);
         }
 
-        // Draw saved boxes
-        this.boxes.forEach((box, idx) => {
-            const cx = box.x * scale;
-            const cy = box.y * scale;
-            const cw = box.w * scale;
-            const ch = box.h * scale;
+        // Check if this is a full_line annotation
+        const isFullLine = this.boxes.length === 1 && this.boxes[0].full_line === true;
 
-            ctx.fillStyle = BOX_COLOR_FILL;
-            ctx.fillRect(cx, cy, cw, ch);
-            ctx.strokeStyle = BOX_COLOR_STROKE;
-            ctx.lineWidth = 1.5;
-            ctx.strokeRect(cx, cy, cw, ch);
+        if (isFullLine) {
+            // Draw full-line badge overlay instead of individual boxes
+            ctx.fillStyle = "rgba(0, 180, 200, 0.15)";
+            ctx.fillRect(0, 0, cssW, cssH);
+            ctx.strokeStyle = "rgba(0, 200, 220, 0.8)";
+            ctx.lineWidth = 3;
+            ctx.setLineDash([8, 4]);
+            ctx.strokeRect(2, 2, cssW - 4, cssH - 4);
+            ctx.setLineDash([]);
 
-            // Index label
-            ctx.fillStyle = LABEL_BG;
-            const label = String(idx + 1);
-            ctx.font = "bold 11px monospace";
-            const tw = ctx.measureText(label).width + 6;
-            ctx.fillRect(cx, cy, tw, 16);
+            // Badge text
+            const badgeText = "📄 FULL LINE";
+            ctx.font = "bold 16px monospace";
+            const tw = ctx.measureText(badgeText).width + 16;
+            const th = 28;
+            const bx = (cssW - tw) / 2;
+            const by = (cssH - th) / 2;
+            ctx.fillStyle = "rgba(0, 160, 180, 0.9)";
+            ctx.beginPath();
+            ctx.roundRect(bx, by, tw, th, 6);
+            ctx.fill();
             ctx.fillStyle = "#fff";
-            ctx.fillText(label, cx + 3, cy + 12);
-        });
+            ctx.fillText(badgeText, bx + 8, by + 19);
+        } else {
+            // Draw saved boxes normally
+            this.boxes.forEach((box, idx) => {
+                const cx = box.x * scale;
+                const cy = box.y * scale;
+                const cw = box.w * scale;
+                const ch = box.h * scale;
+
+                ctx.fillStyle = BOX_COLOR_FILL;
+                ctx.fillRect(cx, cy, cw, ch);
+                ctx.strokeStyle = BOX_COLOR_STROKE;
+                ctx.lineWidth = 1.5;
+                ctx.strokeRect(cx, cy, cw, ch);
+
+                // Index label
+                ctx.fillStyle = LABEL_BG;
+                const label = String(idx + 1);
+                ctx.font = "bold 11px monospace";
+                const tw = ctx.measureText(label).width + 6;
+                ctx.fillRect(cx, cy, tw, 16);
+                ctx.fillStyle = "#fff";
+                ctx.fillText(label, cx + 3, cy + 12);
+            });
+        }
 
         // Draw current rubber-band box
         if (this.drawing) {
@@ -352,6 +380,11 @@ class AnnotationPanel {
                     <button id="tjk-btn-clear" style="
                         background:#45475a; color:#f38ba8; border:1px solid #555;
                         border-radius:4px; padding:4px 12px; cursor:pointer;">Clear (C)</button>
+                    <button id="tjk-btn-full-line" style="
+                        background:#0097a7; color:#fff; border:none;
+                        border-radius:4px; padding:4px 14px; cursor:pointer; font-weight:700;">
+                        📄 Full Line (F)
+                    </button>
                     <button id="tjk-btn-save-next" style="
                         background:#a6e3a1; color:#1e1e2e; border:none;
                         border-radius:4px; padding:4px 14px; cursor:pointer; font-weight:700;">
@@ -393,6 +426,7 @@ class AnnotationPanel {
                     display:flex; flex-wrap:wrap; gap:4px; min-height:24px;"></div>
                 <div style="margin-top:8px; font-size:11px; color:#585b70;">
                     Keyboard: <kbd>Space</kbd>=Save&amp;Next &nbsp;
+                    <kbd>F</kbd>=Full Line &nbsp;
                     <kbd>S</kbd>=Skip &nbsp;
                     <kbd>U</kbd>=Undo &nbsp;
                     <kbd>C</kbd>=Clear &nbsp;
@@ -448,6 +482,7 @@ class AnnotationPanel {
         $("tjk-btn-clear").addEventListener("click", () => {
             if (this.annotationCanvas) this.annotationCanvas.clear();
         });
+        $("tjk-btn-full-line").addEventListener("click", () => this._saveFullLine());
         $("tjk-btn-save-next").addEventListener("click", () => this._saveAndNext());
         $("tjk-btn-undo").addEventListener("click", () => {
             if (this.annotationCanvas) this.annotationCanvas.undo();
@@ -595,6 +630,40 @@ class AnnotationPanel {
         }
     }
 
+    async _saveFullLine() {
+        if (!this.sessionId) return;
+
+        // Disable button briefly to prevent double-click
+        const btn = this.panelEl && this.panelEl.querySelector("#tjk-btn-full-line");
+        if (btn) { btn.disabled = true; btn.textContent = "📄 Saving…"; }
+
+        try {
+            await apiPost(`/session/${this.sessionId}/annotate`, {
+                line_index: this.currentLineIndex,
+                boxes: [{ x: 0, y: 0, w: -1, h: -1, full_line: true }],
+            });
+            await apiPost(`/session/${this.sessionId}/advance`, {});
+            this._updateProgress();
+
+            // Show brief success feedback, then advance
+            this._showStatus("✅ Full line saved!", "success");
+            await new Promise(r => setTimeout(r, 600));
+            this._showStatus(null);
+
+            // Move to next pending line
+            const nextLine = await this._findNextPending(this.currentLineIndex + 1);
+            if (nextLine !== null) {
+                await this._loadLine(nextLine);
+            } else {
+                this._showComplete();
+            }
+        } catch (err) {
+            this._showError("Save Full Line failed: " + err.message);
+        } finally {
+            if (btn) { btn.disabled = false; btn.textContent = "📄 Full Line (F)"; }
+        }
+    }
+
     async _skipLine() {
         if (!this.sessionId) return;
         try {
@@ -713,6 +782,21 @@ class AnnotationPanel {
         if (!el) return;
         if (msg) {
             el.textContent = "⚠ " + msg;
+            el.style.background = "#f38ba822";
+            el.style.color = "#f38ba8";
+            el.style.display = "block";
+        } else {
+            el.style.display = "none";
+        }
+    }
+
+    _showStatus(msg, type) {
+        const el = this.panelEl && this.panelEl.querySelector("#tjk-status-msg");
+        if (!el) return;
+        if (msg) {
+            el.textContent = msg;
+            el.style.background = type === "success" ? "#a6e3a122" : "#89b4fa22";
+            el.style.color     = type === "success" ? "#a6e3a1"   : "#89b4fa";
             el.style.display = "block";
         } else {
             el.style.display = "none";
@@ -740,6 +824,11 @@ class AnnotationPanel {
             case "Enter":
                 e.preventDefault();
                 this._saveAndNext();
+                break;
+            case "f":
+            case "F":
+                e.preventDefault();
+                this._saveFullLine();
                 break;
             case "s":
             case "S":
