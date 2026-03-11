@@ -1220,9 +1220,15 @@ class ReviewPanel {
     // Actions
     // -----------------------------------------------------------------------
     async _accept() {
-        if (this.crops.length === 0) return;
+        if (this.crops.length === 0) {
+            this._showMsg("No crops loaded — click Load first.", "info");
+            return;
+        }
         const textInput = this.panelEl.querySelector("#tjk-rev-text-input");
         const text = textInput ? textInput.value : "";
+
+        // Blur the text input so focus doesn't interfere
+        if (textInput) textInput.blur();
 
         try {
             await apiPost(`/review/${this.label}/approve?output_dir=${encodeURIComponent(this.outputDir)}`, {
@@ -1364,20 +1370,20 @@ class ReviewPanel {
     // Keyboard shortcuts
     // -----------------------------------------------------------------------
     _onKeyDown(e) {
-        // Don't intercept when typing in the text input (except Enter/Tab which are handled there)
+        // Don't intercept when typing in the text input (except Enter/Tab/Escape)
         const tag = e.target.tagName;
-        const isTextInput = (tag === "INPUT" || tag === "TEXTAREA") &&
-                            e.target.id !== "tjk-rev-label-select" &&
-                            e.target.id !== "tjk-rev-output-dir";
+        const isTranscriptionInput = (tag === "INPUT" || tag === "TEXTAREA") &&
+                            e.target.id === "tjk-rev-text-input";
+        const isOtherInput = (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") &&
+                            !isTranscriptionInput;
 
-        if (isTextInput && e.key !== "Escape") return;
+        // Let other inputs (label select, output dir) pass through unhandled
+        if (isOtherInput && e.key !== "Escape") return;
 
         switch (e.key) {
             case "Enter":
-                if (!isTextInput) {
-                    e.preventDefault();
-                    this._accept();
-                }
+                e.preventDefault();
+                this._accept();
                 break;
             case "Tab":
                 e.preventDefault();
