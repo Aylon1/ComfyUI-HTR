@@ -185,13 +185,16 @@ try:
         AnnotationSessionInit,
         AnnotationCropExporter,
         AnnotationSessionStatus,
+        TranscriptionReviewNode,
     )
     NODE_CLASS_MAPPINGS["AnnotationSessionInit"] = AnnotationSessionInit
     NODE_CLASS_MAPPINGS["AnnotationCropExporter"] = AnnotationCropExporter
     NODE_CLASS_MAPPINGS["AnnotationSessionStatus"] = AnnotationSessionStatus
+    NODE_CLASS_MAPPINGS["TranscriptionReviewNode"] = TranscriptionReviewNode
     NODE_DISPLAY_NAME_MAPPINGS["AnnotationSessionInit"] = "Annotation Session Init"
     NODE_DISPLAY_NAME_MAPPINGS["AnnotationCropExporter"] = "Annotation Crop Exporter"
     NODE_DISPLAY_NAME_MAPPINGS["AnnotationSessionStatus"] = "Annotation Session Status"
+    NODE_DISPLAY_NAME_MAPPINGS["TranscriptionReviewNode"] = "Transcription Review"
 except Exception as e:
     logger.warning(f"Could not import annotation_nodes: {e}")
 

@@ -16,11 +16,13 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 from PIL import Image
 
 logger = logging.getLogger("tjk_suetterlin.annotation")
@@ -30,6 +32,9 @@ logger = logging.getLogger("tjk_suetterlin.annotation")
 # Disk backup in session_state.json provides restart resilience.
 # ---------------------------------------------------------------------------
 _ANNOTATION_SESSIONS: dict[str, dict] = {}
+
+# Module-level TrOCR model cache (avoid reloading between calls)
+_TROCR_MODELS: dict[str, Any] = {}
 
 # ---------------------------------------------------------------------------
 # Default paths (resolved at import time)
@@ -64,6 +69,36 @@ def _tensor_to_pil(tensor) -> list[Image.Image]:
         frame = (arr[i] * 255).clip(0, 255).astype(np.uint8)
         images.append(Image.fromarray(frame, mode="RGB"))
     return images
+
+
+def _pil_list_to_tensor(pil_images: list[Image.Image]) -> torch.Tensor:
+    """Convert a list of PIL images to a padded ComfyUI IMAGE tensor [N,H,W,C] float32 [0,1].
+
+    All images are padded with white (1.0) to the maximum height and width in the batch.
+    If the list is empty, returns a 1×64×64×3 white placeholder tensor.
+    """
+    if not pil_images:
+        return torch.ones(1, 64, 64, 3, dtype=torch.float32)
+
+    # Ensure all images are RGB
+    rgb_images = [img.convert("RGB") for img in pil_images]
+
+    max_h = max(img.height for img in rgb_images)
+    max_w = max(img.width for img in rgb_images)
+
+    batch = []
+    for img in rgb_images:
+        arr = np.array(img, dtype=np.float32) / 255.0  # H×W×C
+        h, w, c = arr.shape
+        if h < max_h or w < max_w:
+            # Pad with white (1.0) on bottom and right
+            padded = np.ones((max_h, max_w, c), dtype=np.float32)
+            padded[:h, :w, :] = arr
+            arr = padded
+        batch.append(arr)
+
+    tensor = torch.from_numpy(np.stack(batch, axis=0))  # N×H×W×C
+    return tensor
 
 
 def _session_state_path(working_dir: str, session_id: str) -> Path:
@@ -131,6 +166,41 @@ def _find_sessions_on_disk(base_output_dir: str) -> list[dict]:
         except Exception:
             pass
     return sessions
+
+
+def _load_trocr_model(model_name: str):
+    """Load (or return cached) TrOCR processor + model.
+
+    Returns (processor, model) tuple, or raises on failure.
+    Caches in module-level _TROCR_MODELS dict.
+    """
+    if model_name in _TROCR_MODELS:
+        return _TROCR_MODELS[model_name]
+
+    from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    _safe_print(f"[TranscriptionReview] Loading TrOCR model '{model_name}' on {device}…")
+
+    processor = TrOCRProcessor.from_pretrained(model_name)
+    model = VisionEncoderDecoderModel.from_pretrained(model_name).to(device)
+    model.eval()
+
+    _TROCR_MODELS[model_name] = (processor, model)
+    _safe_print(f"[TranscriptionReview] Model '{model_name}' loaded and cached.")
+    return processor, model
+
+
+def _run_trocr_inference(pil_img: Image.Image, model_name: str) -> str:
+    """Run TrOCR inference on a single PIL image. Returns predicted text."""
+    processor, model = _load_trocr_model(model_name)
+    device = next(model.parameters()).device
+    pixel_values = processor(pil_img.convert("RGB"), return_tensors="pt").pixel_values
+    pixel_values = pixel_values.to(device)
+    with torch.no_grad():
+        generated_ids = model.generate(pixel_values, max_new_tokens=128)
+    text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +329,8 @@ class AnnotationCropExporter:
     """
     Phase 3 node: reads completed annotations from session state and exports
     individual word PNG crops plus a metadata JSON file.
+
+    Also returns all cropped images as a padded IMAGE tensor batch.
     """
 
     CATEGORY = "tjk_suetterlin/annotation"
@@ -278,8 +350,8 @@ class AnnotationCropExporter:
             },
         }
 
-    RETURN_TYPES = ("INT", "STRING", "STRING")
-    RETURN_NAMES = ("exported_count", "output_path", "status")
+    RETURN_TYPES = ("INT", "STRING", "STRING", "IMAGE")
+    RETURN_NAMES = ("exported_count", "output_path", "status", "images")
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -304,7 +376,8 @@ class AnnotationCropExporter:
         if not session:
             status = f"ERROR: Session '{session_id}' not found. Run AnnotationSessionInit first."
             _safe_print(f"[AnnotationCropExporter] {status}")
-            return {"ui": {"text": [status]}, "result": (0, "", status)}
+            placeholder = torch.ones(1, 64, 64, 3, dtype=torch.float32)
+            return {"ui": {"text": [status]}, "result": (0, "", status, placeholder)}
 
         label = session.get("label", "handwritten")
         doc_id = session.get("doc_id", "doc001")
@@ -314,7 +387,8 @@ class AnnotationCropExporter:
         if not annotations:
             status = "WARNING: No annotations found in session. Annotate lines first."
             _safe_print(f"[AnnotationCropExporter] {status}")
-            return {"ui": {"text": [status]}, "result": (0, "", status)}
+            placeholder = torch.ones(1, 64, 64, 3, dtype=torch.float32)
+            return {"ui": {"text": [status]}, "result": (0, "", status, placeholder)}
 
         # Create output directory
         crops_dir = base_dir / label
@@ -323,6 +397,7 @@ class AnnotationCropExporter:
         exported_count = 0
         metadata_lines = []
         export_errors = []
+        all_crop_pils: list[Image.Image] = []
 
         # Build a lookup from line_index → line entry
         lines_by_index = {entry["line_index"]: entry for entry in lines}
@@ -379,6 +454,7 @@ class AnnotationCropExporter:
                 try:
                     crop.save(str(crop_path), format="PNG")
                     exported_count += 1
+                    all_crop_pils.append(crop)
                     word_entries.append({
                         "word_index": word_idx,
                         "bbox_in_line": [x1, y1, x2, y2],
@@ -452,10 +528,13 @@ class AnnotationCropExporter:
         else:
             status = f"Exported {exported_count} crops to {output_path_str}"
 
+        # --- Build IMAGE tensor batch from collected crops ---
+        images_tensor = _pil_list_to_tensor(all_crop_pils)
+
         _safe_print(f"[AnnotationCropExporter] {status}")
         return {
             "ui": {"text": [status]},
-            "result": (exported_count, output_path_str, status),
+            "result": (exported_count, output_path_str, status, images_tensor),
         }
 
 
@@ -558,6 +637,170 @@ class AnnotationSessionStatus:
         return {
             "ui": {"text": [status_text]},
             "result": (status_text, annotated_lines, total_lines, exported_crops),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Node 4: TranscriptionReviewNode
+# ---------------------------------------------------------------------------
+
+class TranscriptionReviewNode:
+    """
+    Transcription review node: scans exported crops, runs TrOCR inference,
+    and creates a review session JSON for the web UI to consume.
+
+    The web panel allows approving/rejecting/skipping each crop and saves
+    approved image+gt.txt pairs in Kraken/Calamari training format.
+    """
+
+    CATEGORY = "tjk_suetterlin/annotation"
+    FUNCTION = "prepare_review"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "session_id": ("STRING", {"default": "session_001"}),
+                "output_dir": ("STRING", {"default": "annotation_output"}),
+                "label": ("STRING", {"default": "handwritten"}),
+                "trocr_model": (
+                    [
+                        "microsoft/trocr-large-handwritten",
+                        "microsoft/trocr-base-handwritten",
+                        "microsoft/trocr-large-printed",
+                        "none",
+                    ],
+                    {"default": "microsoft/trocr-large-handwritten"},
+                ),
+                "training_output_dir": ("STRING", {"default": "training_data"}),
+            },
+        }
+
+    RETURN_TYPES = ("INT", "STRING", "STRING")
+    RETURN_NAMES = ("approved_count", "training_dir", "status")
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def prepare_review(
+        self,
+        session_id="session_001",
+        output_dir="annotation_output",
+        label="handwritten",
+        trocr_model="microsoft/trocr-large-handwritten",
+        training_output_dir="training_data",
+    ):
+        _safe_print(f"[TranscriptionReview] Preparing review for label='{label}'")
+
+        try:
+            import folder_paths
+            base_dir = Path(folder_paths.get_output_directory()) / output_dir
+        except ImportError:
+            base_dir = Path("/tmp") / output_dir
+
+        crops_dir = base_dir / label
+        crops_dir.mkdir(parents=True, exist_ok=True)
+
+        # Resolve training output dir
+        try:
+            import folder_paths
+            training_dir = Path(folder_paths.get_output_directory()) / training_output_dir
+        except ImportError:
+            training_dir = Path("/tmp") / training_output_dir
+        training_dir.mkdir(parents=True, exist_ok=True)
+
+        review_session_path = crops_dir / "review_session.json"
+
+        # Load existing review session if present
+        existing_review: dict = {}
+        if review_session_path.is_file():
+            try:
+                with open(str(review_session_path), "r", encoding="utf-8") as f:
+                    existing_review = json.load(f)
+            except Exception:
+                existing_review = {}
+
+        existing_crops_by_filename: dict[str, dict] = {}
+        for entry in existing_review.get("crops", []):
+            existing_crops_by_filename[entry["filename"]] = entry
+
+        # Scan for PNG files in crops_dir
+        png_files = sorted(crops_dir.glob("*.png"))
+
+        crops_list = []
+        for png_path in png_files:
+            filename = png_path.name
+            stem = png_path.stem
+
+            # Check if already in review session
+            if filename in existing_crops_by_filename:
+                crops_list.append(existing_crops_by_filename[filename])
+                continue
+
+            # Check if already approved (gt.txt exists in training dir)
+            gt_path = training_dir / f"{stem}.gt.txt"
+            if gt_path.is_file():
+                try:
+                    approved_text = gt_path.read_text(encoding="utf-8")
+                except Exception:
+                    approved_text = ""
+                crops_list.append({
+                    "filename": filename,
+                    "filepath": str(png_path.resolve()),
+                    "predicted_text": approved_text,
+                    "status": "approved",
+                    "approved_text": approved_text,
+                })
+                continue
+
+            # Run TrOCR inference (or skip if model == "none")
+            predicted_text = ""
+            if trocr_model != "none":
+                try:
+                    pil_img = Image.open(str(png_path)).convert("RGB")
+                    predicted_text = _run_trocr_inference(pil_img, trocr_model)
+                    _safe_print(f"[TranscriptionReview] {filename}: '{predicted_text}'")
+                except Exception as e:
+                    _safe_print(f"[TranscriptionReview] TrOCR error on {filename}: {e}")
+                    predicted_text = ""
+
+            crops_list.append({
+                "filename": filename,
+                "filepath": str(png_path.resolve()),
+                "predicted_text": predicted_text,
+                "status": "pending",
+                "approved_text": None,
+            })
+
+        # Count approved
+        approved_count = sum(1 for c in crops_list if c.get("status") == "approved")
+
+        # Build and write review session JSON
+        review_session = {
+            "crops": crops_list,
+            "training_output_dir": str(training_dir),
+            "approved_count": approved_count,
+            "label": label,
+            "output_dir": str(base_dir),
+        }
+        try:
+            with open(str(review_session_path), "w", encoding="utf-8") as f:
+                json.dump(review_session, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            _safe_print(f"[TranscriptionReview] Could not write review_session.json: {e}")
+
+        status = (
+            f"Review session ready: {len(crops_list)} crops, "
+            f"{approved_count} already approved. "
+            f"Open the Review panel in the web UI."
+        )
+        _safe_print(f"[TranscriptionReview] {status}")
+
+        return {
+            "ui": {"text": [status]},
+            "result": (approved_count, str(training_dir), status),
         }
 
 
@@ -1022,6 +1265,250 @@ def register_annotation_routes(app):
         "/tjk/annotation/session/{session_id}/export_json", export_json
     )
 
+    # ==================================================================
+    # REVIEW ROUTES — Transcription Review Workflow
+    # ==================================================================
+
+    def _get_review_session_path(label: str, output_dir_str: str) -> Path:
+        """Resolve the review_session.json path from label + output_dir string."""
+        return Path(output_dir_str) / label / "review_session.json"
+
+    def _load_review_session(label: str, output_dir_str: str) -> dict:
+        """Load review_session.json or return empty structure."""
+        path = _get_review_session_path(label, output_dir_str)
+        if path.is_file():
+            try:
+                with open(str(path), "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"crops": [], "training_output_dir": "", "approved_count": 0}
+
+    def _save_review_session(review: dict, label: str, output_dir_str: str) -> None:
+        """Persist review_session.json to disk."""
+        path = _get_review_session_path(label, output_dir_str)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(path), "w", encoding="utf-8") as f:
+            json.dump(review, f, indent=2, ensure_ascii=False)
+
+    def _resolve_output_dir(request) -> str:
+        """Resolve base output dir from query param or default."""
+        output_dir_param = request.rel_url.query.get("output_dir", "annotation_output")
+        try:
+            import folder_paths
+            return str(Path(folder_paths.get_output_directory()) / output_dir_param)
+        except ImportError:
+            return str(Path("/tmp") / output_dir_param)
+
+    # ------------------------------------------------------------------
+    # GET /tjk/annotation/review/{label}
+    # Returns the review session JSON
+    # ------------------------------------------------------------------
+    async def get_review_session(request):
+        label = request.match_info["label"]
+        output_dir_str = _resolve_output_dir(request)
+        review = _load_review_session(label, output_dir_str)
+        return web.json_response(review)
+
+    app.router.add_get("/tjk/annotation/review/{label}", get_review_session)
+
+    # ------------------------------------------------------------------
+    # GET /tjk/annotation/review/{label}/crop/{index}
+    # Returns crop image as base64 PNG + predicted text + status
+    # ------------------------------------------------------------------
+    async def get_review_crop(request):
+        label = request.match_info["label"]
+        try:
+            index = int(request.match_info["index"])
+        except ValueError:
+            return web.json_response({"error": "Invalid index"}, status=400)
+
+        output_dir_str = _resolve_output_dir(request)
+        review = _load_review_session(label, output_dir_str)
+        crops = review.get("crops", [])
+
+        if index < 0 or index >= len(crops):
+            return web.json_response(
+                {"error": f"Index {index} out of range (0–{len(crops)-1})"},
+                status=404
+            )
+
+        crop = crops[index]
+        filepath = crop.get("filepath", "")
+
+        image_b64 = ""
+        if filepath and Path(filepath).is_file():
+            with open(filepath, "rb") as f:
+                image_b64 = base64.b64encode(f.read()).decode("ascii")
+
+        return web.json_response({
+            "index": index,
+            "total": len(crops),
+            "filename": crop.get("filename", ""),
+            "filepath": filepath,
+            "predicted_text": crop.get("predicted_text", ""),
+            "approved_text": crop.get("approved_text"),
+            "status": crop.get("status", "pending"),
+            "image_b64": image_b64,
+        })
+
+    app.router.add_get("/tjk/annotation/review/{label}/crop/{index}", get_review_crop)
+
+    # ------------------------------------------------------------------
+    # POST /tjk/annotation/review/{label}/approve
+    # Body: {"index": N, "text": "approved text"}
+    # ------------------------------------------------------------------
+    async def approve_crop(request):
+        label = request.match_info["label"]
+        output_dir_str = _resolve_output_dir(request)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+        index = body.get("index")
+        text = body.get("text", "")
+
+        if index is None:
+            return web.json_response({"error": "Missing 'index'"}, status=400)
+
+        index = int(index)
+        review = _load_review_session(label, output_dir_str)
+        crops = review.get("crops", [])
+
+        if index < 0 or index >= len(crops):
+            return web.json_response({"error": f"Index {index} out of range"}, status=404)
+
+        crop = crops[index]
+        crop["status"] = "approved"
+        crop["approved_text"] = text
+
+        # Save training files
+        training_dir_str = review.get("training_output_dir", "")
+        if training_dir_str:
+            training_dir = Path(training_dir_str)
+            training_dir.mkdir(parents=True, exist_ok=True)
+
+            filename = crop.get("filename", "")
+            filepath = crop.get("filepath", "")
+            stem = Path(filename).stem if filename else ""
+
+            # Copy PNG crop
+            if filepath and Path(filepath).is_file() and filename:
+                dest_img = training_dir / filename
+                try:
+                    shutil.copy2(filepath, str(dest_img))
+                except Exception as e:
+                    _safe_print(f"[ReviewRoutes] Could not copy crop: {e}")
+
+            # Write gt.txt (no trailing newline, UTF-8)
+            if stem:
+                gt_path = training_dir / f"{stem}.gt.txt"
+                try:
+                    gt_path.write_bytes(text.encode("utf-8"))
+                except Exception as e:
+                    _safe_print(f"[ReviewRoutes] Could not write gt.txt: {e}")
+
+        # Update approved count
+        review["approved_count"] = sum(1 for c in crops if c.get("status") == "approved")
+        _save_review_session(review, label, output_dir_str)
+
+        return web.json_response({
+            "ok": True,
+            "index": index,
+            "status": "approved",
+            "approved_count": review["approved_count"],
+        })
+
+    app.router.add_post("/tjk/annotation/review/{label}/approve", approve_crop)
+
+    # ------------------------------------------------------------------
+    # POST /tjk/annotation/review/{label}/reject
+    # Body: {"index": N}
+    # ------------------------------------------------------------------
+    async def reject_crop(request):
+        label = request.match_info["label"]
+        output_dir_str = _resolve_output_dir(request)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+        index = body.get("index")
+        if index is None:
+            return web.json_response({"error": "Missing 'index'"}, status=400)
+
+        index = int(index)
+        review = _load_review_session(label, output_dir_str)
+        crops = review.get("crops", [])
+
+        if index < 0 or index >= len(crops):
+            return web.json_response({"error": f"Index {index} out of range"}, status=404)
+
+        crops[index]["status"] = "rejected"
+        crops[index]["approved_text"] = None
+        review["approved_count"] = sum(1 for c in crops if c.get("status") == "approved")
+        _save_review_session(review, label, output_dir_str)
+
+        return web.json_response({"ok": True, "index": index, "status": "rejected"})
+
+    app.router.add_post("/tjk/annotation/review/{label}/reject", reject_crop)
+
+    # ------------------------------------------------------------------
+    # POST /tjk/annotation/review/{label}/skip
+    # Body: {"index": N}
+    # ------------------------------------------------------------------
+    async def skip_crop(request):
+        label = request.match_info["label"]
+        output_dir_str = _resolve_output_dir(request)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+        index = body.get("index")
+        if index is None:
+            return web.json_response({"error": "Missing 'index'"}, status=400)
+
+        index = int(index)
+        review = _load_review_session(label, output_dir_str)
+        crops = review.get("crops", [])
+
+        if index < 0 or index >= len(crops):
+            return web.json_response({"error": f"Index {index} out of range"}, status=404)
+
+        crops[index]["status"] = "skipped"
+        review["approved_count"] = sum(1 for c in crops if c.get("status") == "approved")
+        _save_review_session(review, label, output_dir_str)
+
+        return web.json_response({"ok": True, "index": index, "status": "skipped"})
+
+    app.router.add_post("/tjk/annotation/review/{label}/skip", skip_crop)
+
+    # ------------------------------------------------------------------
+    # GET /tjk/annotation/review/{label}/stats
+    # Returns counts of pending/approved/rejected/skipped
+    # ------------------------------------------------------------------
+    async def get_review_stats(request):
+        label = request.match_info["label"]
+        output_dir_str = _resolve_output_dir(request)
+        review = _load_review_session(label, output_dir_str)
+        crops = review.get("crops", [])
+
+        stats = {
+            "total": len(crops),
+            "pending": sum(1 for c in crops if c.get("status") == "pending"),
+            "approved": sum(1 for c in crops if c.get("status") == "approved"),
+            "rejected": sum(1 for c in crops if c.get("status") == "rejected"),
+            "skipped": sum(1 for c in crops if c.get("status") == "skipped"),
+        }
+        return web.json_response(stats)
+
+    app.router.add_get("/tjk/annotation/review/{label}/stats", get_review_stats)
+
 
 # ---------------------------------------------------------------------------
 # Module-level route registration (called at import time)
@@ -1042,10 +1529,12 @@ NODE_CLASS_MAPPINGS = {
     "AnnotationSessionInit": AnnotationSessionInit,
     "AnnotationCropExporter": AnnotationCropExporter,
     "AnnotationSessionStatus": AnnotationSessionStatus,
+    "TranscriptionReviewNode": TranscriptionReviewNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AnnotationSessionInit": "Annotation Session Init",
     "AnnotationCropExporter": "Annotation Crop Exporter",
     "AnnotationSessionStatus": "Annotation Session Status",
+    "TranscriptionReviewNode": "Transcription Review",
 }

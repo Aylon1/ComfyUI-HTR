@@ -1,8 +1,11 @@
 /**
- * Sütterlin Word Annotation Panel
+ * Sütterlin Word Annotation Panel + Transcription Review Panel
  * ComfyUI frontend extension for handwriting training data collection.
  *
- * Registers a floating annotation panel accessible from the ComfyUI menu.
+ * Registers two floating panels accessible from the ComfyUI menu:
+ *   ✏️ Annotate       — draw bounding boxes on line images
+ *   📝 Review         — review/approve TrOCR transcriptions
+ *
  * Uses the REST API at /tjk/annotation/* to load sessions and save annotations.
  */
 
@@ -263,7 +266,7 @@ async function apiDelete(path) {
 }
 
 // ---------------------------------------------------------------------------
-// AnnotationPanel — the full floating UI
+// AnnotationPanel — the full floating annotation UI
 // ---------------------------------------------------------------------------
 class AnnotationPanel {
     constructor() {
@@ -769,66 +772,628 @@ class AnnotationPanel {
 }
 
 // ---------------------------------------------------------------------------
+// ReviewPanel — Transcription Review UI
+// ---------------------------------------------------------------------------
+class ReviewPanel {
+    constructor() {
+        this.label = "handwritten";
+        this.outputDir = "annotation_output";
+        this.crops = [];
+        this.currentIndex = 0;
+        this.stats = { total: 0, pending: 0, approved: 0, rejected: 0, skipped: 0 };
+        this.panelEl = null;
+        this.visible = false;
+        this._keyHandler = this._onKeyDown.bind(this);
+    }
+
+    // -----------------------------------------------------------------------
+    // Build DOM
+    // -----------------------------------------------------------------------
+    _buildPanel() {
+        const panel = document.createElement("div");
+        panel.id = "tjk-review-panel";
+        panel.style.cssText = `
+            position: fixed;
+            top: 60px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: min(700px, 96vw);
+            max-height: 92vh;
+            overflow-y: auto;
+            background: #1e1e2e;
+            border: 1px solid #444;
+            border-radius: 8px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.7);
+            z-index: 9999;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            font-size: 13px;
+            color: #cdd6f4;
+            display: none;
+        `;
+
+        panel.innerHTML = `
+            <!-- Header -->
+            <div id="tjk-rev-header" style="
+                display:flex; align-items:center; justify-content:space-between;
+                padding:10px 16px; background:#181825; border-radius:8px 8px 0 0;
+                border-bottom:1px solid #333; cursor:move; user-select:none;">
+                <span style="font-weight:700; font-size:15px;">📝 Transcription Review</span>
+                <div style="display:flex; gap:8px; align-items:center;">
+                    <select id="tjk-rev-label-select" style="
+                        background:#313244; color:#cdd6f4; border:1px solid #555;
+                        border-radius:4px; padding:3px 8px; font-size:12px;">
+                        <option value="handwritten">handwritten</option>
+                        <option value="printed">printed</option>
+                    </select>
+                    <input id="tjk-rev-output-dir" type="text" value="annotation_output"
+                        placeholder="output_dir" style="
+                        background:#313244; color:#cdd6f4; border:1px solid #555;
+                        border-radius:4px; padding:3px 8px; font-size:12px; width:140px;" />
+                    <button id="tjk-rev-load" style="
+                        background:#89b4fa; color:#1e1e2e; border:none;
+                        border-radius:4px; padding:3px 10px; cursor:pointer; font-weight:700;">Load</button>
+                    <button id="tjk-rev-close" style="
+                        background:#f38ba8; color:#1e1e2e; border:none;
+                        border-radius:4px; padding:3px 10px; cursor:pointer; font-weight:700;">✕</button>
+                </div>
+            </div>
+
+            <div style="padding:12px 16px 4px;">
+                <!-- Progress bar -->
+                <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
+                    <div style="flex:1; background:#313244; border-radius:4px; height:8px; overflow:hidden;">
+                        <div id="tjk-rev-progress-bar" style="height:100%; background:#a6e3a1; width:0%; transition:width 0.3s;"></div>
+                    </div>
+                    <span id="tjk-rev-progress-text" style="font-size:12px; color:#a6adc8; white-space:nowrap;">0 / 0</span>
+                </div>
+                <!-- Stats line -->
+                <div id="tjk-rev-stats" style="font-size:11px; color:#585b70; margin-bottom:10px;">
+                    — pending | — approved | — rejected | — skipped
+                </div>
+
+                <!-- Navigation -->
+                <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px;">
+                    <button id="tjk-rev-btn-prev" style="
+                        background:#313244; color:#cdd6f4; border:1px solid #555;
+                        border-radius:4px; padding:4px 12px; cursor:pointer;">◀</button>
+                    <span id="tjk-rev-crop-label" style="
+                        font-size:12px; color:#a6adc8; min-width:120px; text-align:center;">
+                        — / —
+                    </span>
+                    <button id="tjk-rev-btn-next" style="
+                        background:#313244; color:#cdd6f4; border:1px solid #555;
+                        border-radius:4px; padding:4px 12px; cursor:pointer;">▶</button>
+                    <span id="tjk-rev-filename" style="font-size:11px; color:#585b70; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+                </div>
+
+                <!-- Crop image display -->
+                <div style="text-align:center; margin-bottom:12px; min-height:80px;
+                    background:#0d0d1a; border:1px solid #333; border-radius:6px; padding:8px;">
+                    <img id="tjk-rev-crop-img" src="" alt="crop"
+                        style="max-width:600px; max-height:300px; object-fit:contain;
+                        display:none; border-radius:4px;" />
+                    <div id="tjk-rev-no-image" style="color:#585b70; padding:20px; font-size:12px;">
+                        No crop loaded
+                    </div>
+                </div>
+
+                <!-- Status badge -->
+                <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+                    <span style="font-size:12px; color:#a6adc8;">Status:</span>
+                    <span id="tjk-rev-status-badge" style="
+                        font-size:12px; font-weight:700; padding:2px 8px;
+                        border-radius:4px; background:#313244; color:#cdd6f4;">pending</span>
+                </div>
+
+                <!-- Transcription text input -->
+                <div style="margin-bottom:10px;">
+                    <label style="font-size:12px; color:#a6adc8; display:block; margin-bottom:4px;">
+                        Transcription (Tab to focus, Enter to accept):
+                    </label>
+                    <input id="tjk-rev-text-input" type="text" style="
+                        width:100%; box-sizing:border-box;
+                        background:#313244; color:#cdd6f4;
+                        border:1px solid #555; border-radius:6px;
+                        padding:8px 12px; font-size:18px;
+                        font-family: 'Segoe UI', system-ui, sans-serif;
+                        outline:none;" placeholder="Transcription…" />
+                </div>
+
+                <!-- Action buttons -->
+                <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
+                    <button id="tjk-rev-btn-accept" style="
+                        flex:1; min-width:100px;
+                        background:#a6e3a1; color:#1e1e2e; border:none;
+                        border-radius:6px; padding:8px 16px; cursor:pointer;
+                        font-weight:700; font-size:13px;">
+                        ✅ Accept (Enter)
+                    </button>
+                    <button id="tjk-rev-btn-edit" style="
+                        flex:1; min-width:100px;
+                        background:#89b4fa; color:#1e1e2e; border:none;
+                        border-radius:6px; padding:8px 16px; cursor:pointer;
+                        font-weight:700; font-size:13px;">
+                        ✏️ Edit &amp; Accept (Tab)
+                    </button>
+                    <button id="tjk-rev-btn-reject" style="
+                        flex:1; min-width:100px;
+                        background:#f38ba8; color:#1e1e2e; border:none;
+                        border-radius:6px; padding:8px 16px; cursor:pointer;
+                        font-weight:700; font-size:13px;">
+                        ❌ Reject (R)
+                    </button>
+                    <button id="tjk-rev-btn-skip" style="
+                        flex:1; min-width:100px;
+                        background:#45475a; color:#cdd6f4; border:1px solid #555;
+                        border-radius:6px; padding:8px 16px; cursor:pointer;
+                        font-weight:700; font-size:13px;">
+                        ⏭️ Skip (S)
+                    </button>
+                </div>
+
+                <!-- Error/status message -->
+                <div id="tjk-rev-msg" style="
+                    display:none; padding:6px 10px; border-radius:4px;
+                    background:#f38ba822; color:#f38ba8; font-size:12px; margin-bottom:6px;">
+                </div>
+
+                <!-- Keyboard hint -->
+                <div style="font-size:11px; color:#585b70; margin-bottom:8px;">
+                    Keyboard: <kbd>Enter</kbd>=Accept &nbsp;
+                    <kbd>Tab</kbd>=Edit &nbsp;
+                    <kbd>R</kbd>=Reject &nbsp;
+                    <kbd>S</kbd>=Skip &nbsp;
+                    <kbd>←</kbd><kbd>→</kbd>=Navigate &nbsp;
+                    <kbd>Esc</kbd>=Close
+                </div>
+            </div>
+        `;
+
+        return panel;
+    }
+
+    // -----------------------------------------------------------------------
+    // Show / hide
+    // -----------------------------------------------------------------------
+    show() {
+        if (!this.panelEl) {
+            this.panelEl = this._buildPanel();
+            document.body.appendChild(this.panelEl);
+            this._bindEvents();
+        }
+        this.panelEl.style.display = "block";
+        this.visible = true;
+        document.addEventListener("keydown", this._keyHandler);
+    }
+
+    hide() {
+        if (this.panelEl) this.panelEl.style.display = "none";
+        this.visible = false;
+        document.removeEventListener("keydown", this._keyHandler);
+    }
+
+    toggle() {
+        if (this.visible) this.hide(); else this.show();
+    }
+
+    // -----------------------------------------------------------------------
+    // Event binding
+    // -----------------------------------------------------------------------
+    _bindEvents() {
+        const $ = id => this.panelEl.querySelector("#" + id);
+
+        $("tjk-rev-close").addEventListener("click", () => this.hide());
+        $("tjk-rev-load").addEventListener("click", () => this._loadReview());
+
+        $("tjk-rev-btn-prev").addEventListener("click", () => this._navigateTo(this.currentIndex - 1));
+        $("tjk-rev-btn-next").addEventListener("click", () => this._navigateTo(this.currentIndex + 1));
+
+        $("tjk-rev-btn-accept").addEventListener("click", () => this._accept());
+        $("tjk-rev-btn-edit").addEventListener("click", () => {
+            $("tjk-rev-text-input").focus();
+            $("tjk-rev-text-input").select();
+        });
+        $("tjk-rev-btn-reject").addEventListener("click", () => this._reject());
+        $("tjk-rev-btn-skip").addEventListener("click", () => this._skip());
+
+        // Accept on Enter inside text input
+        $("tjk-rev-text-input").addEventListener("keydown", e => {
+            if (e.key === "Enter") {
+                e.preventDefault();
+                e.stopPropagation();
+                this._accept();
+            }
+        });
+
+        // Make panel draggable by header
+        this._makeDraggable($("tjk-rev-header"), this.panelEl);
+    }
+
+    _makeDraggable(handle, panel) {
+        let dragging = false, ox = 0, oy = 0;
+        handle.addEventListener("mousedown", e => {
+            if (e.target.tagName === "BUTTON" || e.target.tagName === "SELECT" ||
+                e.target.tagName === "INPUT") return;
+            dragging = true;
+            const rect = panel.getBoundingClientRect();
+            ox = e.clientX - rect.left;
+            oy = e.clientY - rect.top;
+            e.preventDefault();
+        });
+        document.addEventListener("mousemove", e => {
+            if (!dragging) return;
+            panel.style.left = (e.clientX - ox) + "px";
+            panel.style.top = (e.clientY - oy) + "px";
+            panel.style.transform = "none";
+        });
+        document.addEventListener("mouseup", () => { dragging = false; });
+    }
+
+    // -----------------------------------------------------------------------
+    // Data loading
+    // -----------------------------------------------------------------------
+    async _loadReview() {
+        const labelSel = this.panelEl.querySelector("#tjk-rev-label-select");
+        const outputDirInput = this.panelEl.querySelector("#tjk-rev-output-dir");
+        this.label = labelSel ? labelSel.value : "handwritten";
+        this.outputDir = outputDirInput ? outputDirInput.value.trim() : "annotation_output";
+
+        this._showMsg(null);
+        try {
+            const data = await apiGet(`/review/${this.label}?output_dir=${encodeURIComponent(this.outputDir)}`);
+            this.crops = data.crops || [];
+            this._showMsg(null);
+
+            if (this.crops.length === 0) {
+                this._showMsg("No crops found. Run TranscriptionReviewNode first.", "info");
+                this._updateProgressUI();
+                return;
+            }
+
+            // Find first pending crop
+            const firstPending = this.crops.findIndex(c => c.status === "pending");
+            const startIdx = firstPending >= 0 ? firstPending : 0;
+            await this._loadCrop(startIdx);
+            await this._refreshStats();
+        } catch (err) {
+            this._showMsg("Could not load review session: " + err.message);
+        }
+    }
+
+    async _loadCrop(index) {
+        if (index < 0) index = 0;
+        if (index >= this.crops.length) index = this.crops.length - 1;
+        if (this.crops.length === 0) return;
+
+        this.currentIndex = index;
+        this._showMsg(null);
+
+        try {
+            const data = await apiGet(
+                `/review/${this.label}/crop/${index}?output_dir=${encodeURIComponent(this.outputDir)}`
+            );
+
+            // Update image
+            const img = this.panelEl.querySelector("#tjk-rev-crop-img");
+            const noImg = this.panelEl.querySelector("#tjk-rev-no-image");
+            if (data.image_b64) {
+                img.src = "data:image/png;base64," + data.image_b64;
+                img.style.display = "block";
+                noImg.style.display = "none";
+            } else {
+                img.style.display = "none";
+                noImg.style.display = "block";
+            }
+
+            // Update text input
+            const textInput = this.panelEl.querySelector("#tjk-rev-text-input");
+            if (textInput) {
+                const displayText = data.approved_text !== null && data.approved_text !== undefined
+                    ? data.approved_text
+                    : (data.predicted_text || "");
+                textInput.value = displayText;
+            }
+
+            // Update filename
+            const fnEl = this.panelEl.querySelector("#tjk-rev-filename");
+            if (fnEl) fnEl.textContent = data.filename || "";
+
+            // Update status badge
+            this._updateStatusBadge(data.status || "pending");
+
+            // Update nav label
+            const navLabel = this.panelEl.querySelector("#tjk-rev-crop-label");
+            if (navLabel) navLabel.textContent = `${index + 1} / ${this.crops.length}`;
+
+            // Sync local crops array
+            if (this.crops[index]) {
+                this.crops[index].status = data.status;
+                this.crops[index].approved_text = data.approved_text;
+                this.crops[index].predicted_text = data.predicted_text;
+            }
+
+        } catch (err) {
+            this._showMsg("Could not load crop: " + err.message);
+        }
+    }
+
+    async _refreshStats() {
+        try {
+            const stats = await apiGet(
+                `/review/${this.label}/stats?output_dir=${encodeURIComponent(this.outputDir)}`
+            );
+            this.stats = stats;
+            this._updateProgressUI();
+        } catch { /* ignore */ }
+    }
+
+    // -----------------------------------------------------------------------
+    // Actions
+    // -----------------------------------------------------------------------
+    async _accept() {
+        if (this.crops.length === 0) return;
+        const textInput = this.panelEl.querySelector("#tjk-rev-text-input");
+        const text = textInput ? textInput.value : "";
+
+        try {
+            await apiPost(`/review/${this.label}/approve?output_dir=${encodeURIComponent(this.outputDir)}`, {
+                index: this.currentIndex,
+                text: text,
+            });
+            if (this.crops[this.currentIndex]) {
+                this.crops[this.currentIndex].status = "approved";
+                this.crops[this.currentIndex].approved_text = text;
+            }
+            this._updateStatusBadge("approved");
+            await this._refreshStats();
+            // Advance to next pending
+            const next = this._findNextPending(this.currentIndex + 1);
+            if (next !== null) {
+                await this._loadCrop(next);
+            } else {
+                this._showMsg("✅ All crops reviewed!", "success");
+            }
+        } catch (err) {
+            this._showMsg("Accept failed: " + err.message);
+        }
+    }
+
+    async _reject() {
+        if (this.crops.length === 0) return;
+        try {
+            await apiPost(`/review/${this.label}/reject?output_dir=${encodeURIComponent(this.outputDir)}`, {
+                index: this.currentIndex,
+            });
+            if (this.crops[this.currentIndex]) {
+                this.crops[this.currentIndex].status = "rejected";
+            }
+            this._updateStatusBadge("rejected");
+            await this._refreshStats();
+            const next = this._findNextPending(this.currentIndex + 1);
+            if (next !== null) {
+                await this._loadCrop(next);
+            } else {
+                this._showMsg("All crops reviewed!", "success");
+            }
+        } catch (err) {
+            this._showMsg("Reject failed: " + err.message);
+        }
+    }
+
+    async _skip() {
+        if (this.crops.length === 0) return;
+        try {
+            await apiPost(`/review/${this.label}/skip?output_dir=${encodeURIComponent(this.outputDir)}`, {
+                index: this.currentIndex,
+            });
+            if (this.crops[this.currentIndex]) {
+                this.crops[this.currentIndex].status = "skipped";
+            }
+            this._updateStatusBadge("skipped");
+            await this._refreshStats();
+            const next = this._findNextPending(this.currentIndex + 1);
+            if (next !== null) {
+                await this._loadCrop(next);
+            } else {
+                this._showMsg("All crops reviewed!", "success");
+            }
+        } catch (err) {
+            this._showMsg("Skip failed: " + err.message);
+        }
+    }
+
+    async _navigateTo(index) {
+        if (this.crops.length === 0) return;
+        if (index < 0) index = 0;
+        if (index >= this.crops.length) index = this.crops.length - 1;
+        await this._loadCrop(index);
+    }
+
+    _findNextPending(fromIndex) {
+        for (let i = fromIndex; i < this.crops.length; i++) {
+            if (this.crops[i].status === "pending") return i;
+        }
+        return null;
+    }
+
+    // -----------------------------------------------------------------------
+    // UI updates
+    // -----------------------------------------------------------------------
+    _updateProgressUI() {
+        const total = this.stats.total || this.crops.length;
+        const approved = this.stats.approved || 0;
+        const pending = this.stats.pending || 0;
+        const rejected = this.stats.rejected || 0;
+        const skipped = this.stats.skipped || 0;
+        const pct = total > 0 ? ((approved + rejected + skipped) / total * 100).toFixed(0) : 0;
+
+        const bar = this.panelEl.querySelector("#tjk-rev-progress-bar");
+        const text = this.panelEl.querySelector("#tjk-rev-progress-text");
+        const statsEl = this.panelEl.querySelector("#tjk-rev-stats");
+
+        if (bar) bar.style.width = pct + "%";
+        if (text) text.textContent = `${approved} / ${total} approved`;
+        if (statsEl) {
+            statsEl.textContent =
+                `${pending} pending | ${approved} approved | ${rejected} rejected | ${skipped} skipped`;
+        }
+    }
+
+    _updateStatusBadge(status) {
+        const badge = this.panelEl.querySelector("#tjk-rev-status-badge");
+        if (!badge) return;
+        const colors = {
+            pending:  { bg: "#313244", color: "#cdd6f4" },
+            approved: { bg: "#a6e3a122", color: "#a6e3a1" },
+            rejected: { bg: "#f38ba822", color: "#f38ba8" },
+            skipped:  { bg: "#45475a",  color: "#a6adc8" },
+        };
+        const c = colors[status] || colors.pending;
+        badge.style.background = c.bg;
+        badge.style.color = c.color;
+        badge.textContent = status;
+    }
+
+    _showMsg(msg, type) {
+        const el = this.panelEl && this.panelEl.querySelector("#tjk-rev-msg");
+        if (!el) return;
+        if (msg) {
+            el.textContent = (type === "success" ? "✅ " : type === "info" ? "ℹ️ " : "⚠ ") + msg;
+            el.style.background = type === "success" ? "#a6e3a122"
+                                 : type === "info"    ? "#89b4fa22"
+                                 : "#f38ba822";
+            el.style.color = type === "success" ? "#a6e3a1"
+                            : type === "info"    ? "#89b4fa"
+                            : "#f38ba8";
+            el.style.display = "block";
+        } else {
+            el.style.display = "none";
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Keyboard shortcuts
+    // -----------------------------------------------------------------------
+    _onKeyDown(e) {
+        // Don't intercept when typing in the text input (except Enter/Tab which are handled there)
+        const tag = e.target.tagName;
+        const isTextInput = (tag === "INPUT" || tag === "TEXTAREA") &&
+                            e.target.id !== "tjk-rev-label-select" &&
+                            e.target.id !== "tjk-rev-output-dir";
+
+        if (isTextInput && e.key !== "Escape") return;
+
+        switch (e.key) {
+            case "Enter":
+                if (!isTextInput) {
+                    e.preventDefault();
+                    this._accept();
+                }
+                break;
+            case "Tab":
+                e.preventDefault();
+                {
+                    const inp = this.panelEl.querySelector("#tjk-rev-text-input");
+                    if (inp) { inp.focus(); inp.select(); }
+                }
+                break;
+            case "r":
+            case "R":
+                if (!isTextInput) {
+                    e.preventDefault();
+                    this._reject();
+                }
+                break;
+            case "s":
+            case "S":
+                if (!isTextInput) {
+                    e.preventDefault();
+                    this._skip();
+                }
+                break;
+            case "ArrowLeft":
+                if (!isTextInput) {
+                    e.preventDefault();
+                    this._navigateTo(this.currentIndex - 1);
+                }
+                break;
+            case "ArrowRight":
+                if (!isTextInput) {
+                    e.preventDefault();
+                    this._navigateTo(this.currentIndex + 1);
+                }
+                break;
+            case "Escape":
+                this.hide();
+                break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ComfyUI Extension Registration
 // ---------------------------------------------------------------------------
-let _panel = null;
+let _annotationPanel = null;
+let _reviewPanel = null;
 
-function getPanel() {
-    if (!_panel) _panel = new AnnotationPanel();
-    return _panel;
+function getAnnotationPanel() {
+    if (!_annotationPanel) _annotationPanel = new AnnotationPanel();
+    return _annotationPanel;
+}
+
+function getReviewPanel() {
+    if (!_reviewPanel) _reviewPanel = new ReviewPanel();
+    return _reviewPanel;
 }
 
 app.registerExtension({
     name: "tjk_suetterlin.AnnotationPanel",
 
     async setup() {
-        // Add menu button to ComfyUI's top menu bar
-        // ComfyUI exposes app.menu or app.ui.menuContainer depending on version
+        // Add menu buttons to ComfyUI's top menu bar
         try {
-            // Try modern ComfyUI menu API first
-            if (app.menu && app.menu.settingsGroup) {
-                // Use the extensionManager button approach
-                const btn = document.createElement("button");
-                btn.textContent = "✏️ Annotate Lines";
-                btn.title = "Open Sütterlin Word Annotation Panel";
-                btn.style.cssText = `
-                    background: #313244;
-                    color: #cdd6f4;
-                    border: 1px solid #555;
-                    border-radius: 4px;
-                    padding: 4px 10px;
-                    cursor: pointer;
-                    font-size: 12px;
-                    margin: 0 4px;
-                `;
-                btn.addEventListener("click", () => getPanel().toggle());
-
-                // Try to insert into the menu bar
-                const menuBar = document.querySelector(".comfyui-menu") ||
-                                 document.querySelector("#comfy-menu") ||
-                                 document.querySelector(".menu");
-                if (menuBar) {
-                    menuBar.appendChild(btn);
-                } else {
-                    // Fallback: floating trigger button in top-right corner
-                    _addFloatingTrigger();
-                }
+            const menuBar = document.querySelector(".comfyui-menu") ||
+                             document.querySelector("#comfy-menu") ||
+                             document.querySelector(".menu");
+            if (menuBar) {
+                const annotateBtn = _makeMenuButton("✏️ Annotate", () => getAnnotationPanel().toggle());
+                const reviewBtn   = _makeMenuButton("📝 Review Transcriptions", () => getReviewPanel().toggle());
+                menuBar.appendChild(annotateBtn);
+                menuBar.appendChild(reviewBtn);
             } else {
-                _addFloatingTrigger();
+                _addFloatingTriggers();
             }
         } catch (err) {
-            console.warn("[tjk_suetterlin] Could not add menu button:", err);
-            _addFloatingTrigger();
+            console.warn("[tjk_suetterlin] Could not add menu buttons:", err);
+            _addFloatingTriggers();
         }
     },
 });
 
-function _addFloatingTrigger() {
-    const trigger = document.createElement("button");
-    trigger.id = "tjk-annotation-trigger";
-    trigger.textContent = "✏️ Annotate";
-    trigger.title = "Open Sütterlin Word Annotation Panel";
-    trigger.style.cssText = `
+function _makeMenuButton(label, onClick) {
+    const btn = document.createElement("button");
+    btn.textContent = label;
+    btn.style.cssText = `
+        background: #313244;
+        color: #cdd6f4;
+        border: 1px solid #555;
+        border-radius: 4px;
+        padding: 4px 10px;
+        cursor: pointer;
+        font-size: 12px;
+        margin: 0 4px;
+    `;
+    btn.addEventListener("click", onClick);
+    return btn;
+}
+
+function _addFloatingTriggers() {
+    // Annotation trigger
+    const annotateBtn = document.createElement("button");
+    annotateBtn.id = "tjk-annotation-trigger";
+    annotateBtn.textContent = "✏️ Annotate";
+    annotateBtn.title = "Open Sütterlin Word Annotation Panel";
+    annotateBtn.style.cssText = `
         position: fixed;
         top: 10px;
         right: 10px;
@@ -843,6 +1408,29 @@ function _addFloatingTrigger() {
         font-family: 'Segoe UI', system-ui, sans-serif;
         box-shadow: 0 2px 8px rgba(0,0,0,0.5);
     `;
-    trigger.addEventListener("click", () => getPanel().toggle());
-    document.body.appendChild(trigger);
+    annotateBtn.addEventListener("click", () => getAnnotationPanel().toggle());
+    document.body.appendChild(annotateBtn);
+
+    // Review trigger
+    const reviewBtn = document.createElement("button");
+    reviewBtn.id = "tjk-review-trigger";
+    reviewBtn.textContent = "📝 Review Transcriptions";
+    reviewBtn.title = "Open Transcription Review Panel";
+    reviewBtn.style.cssText = `
+        position: fixed;
+        top: 10px;
+        right: 130px;
+        z-index: 9998;
+        background: #313244;
+        color: #cdd6f4;
+        border: 1px solid #555;
+        border-radius: 6px;
+        padding: 6px 14px;
+        cursor: pointer;
+        font-size: 13px;
+        font-family: 'Segoe UI', system-ui, sans-serif;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+    `;
+    reviewBtn.addEventListener("click", () => getReviewPanel().toggle());
+    document.body.appendChild(reviewBtn);
 }
